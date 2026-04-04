@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.pt
+checkpoints/
+results/
+logs/
+.pytest_cache/
+vendor/PC-Transformers/data_preparation/data/
+vendor/PC-Transformers/data_preparation/encoded/
+vendor/PC-Transformers/data_preparation/tokenizer.json
+docs/references

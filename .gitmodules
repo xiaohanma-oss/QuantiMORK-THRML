@@ -1,0 +1,3 @@
+[submodule "vendor/PC-Transformers"]
+	path = vendor/PC-Transformers
+	url = https://github.com/iCog-Labs-Dev/PC-Transformers.git
