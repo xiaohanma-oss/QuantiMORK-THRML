@@ -18,5 +18,4 @@ logs/
 vendor/PC-Transformers/data_preparation/data/
 vendor/PC-Transformers/data_preparation/encoded/
 vendor/PC-Transformers/data_preparation/tokenizer.json
-docs/references
-docs/internal/
+docs/

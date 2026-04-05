@@ -38,8 +38,8 @@ as a baseline, replaces its dense MLP layers with Haar wavelet-sparse
 wavelet-sparse variant (a) produces comparable language modeling results,
 and (b) maps to thrml factor graphs for TSU execution.
 
-Together with [PLN-THRML](https://github.com/mafeifei666666/PLN-THRML) (reasoning, §6)
-and [ECAN-THRML](https://github.com/mafeifei666666/ECAN-THRML) (attention, §5.4),
+Together with [PLN-THRML](https://github.com/xiaohanma-oss/PLN-THRML) (reasoning, §6)
+and [ECAN-THRML](https://github.com/xiaohanma-oss/ECAN-THRML) (attention, §5.4),
 this completes the Hyperon-on-TSU trifecta.
 
 <details>
@@ -125,7 +125,7 @@ QuantiMORK WaveletLinear(512, 512, levels=3):
 ## Installation
 
 ```bash
-git clone https://github.com/mafeifei666666/QuantiMORK-THRML.git
+git clone https://github.com/xiaohanma-oss/QuantiMORK-THRML.git
 cd QuantiMORK-THRML
 git submodule update --init          # pull PC-Transformers baseline
 pip install -e ".[dev]"              # core + pytest
