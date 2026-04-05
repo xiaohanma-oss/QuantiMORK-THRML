@@ -2,7 +2,7 @@
 name = "quantimork-thrml"
 version = "0.1.0"
 description = "QuantiMORK (§7.4) wavelet-sparse predictive coding compiled to thermodynamic factor graphs"
-authors = [{name = "Xiaohan Ma"}]
+authors = [{name = "Xiaohan Ma", email = "max257548@gmail.com"}]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,15 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/xiaohanma-oss/QuantiMORK-THRML"
+Repository = "https://github.com/xiaohanma-oss/QuantiMORK-THRML"
+Issues = "https://github.com/xiaohanma-oss/QuantiMORK-THRML/issues"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
 thrml = [
