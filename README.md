@@ -38,6 +38,10 @@ as a baseline, replaces its dense MLP layers with Haar wavelet-sparse
 wavelet-sparse variant (a) produces comparable language modeling results,
 and (b) maps to thrml factor graphs for TSU execution.
 
+Together with [PLN-THRML](https://github.com/mafeifei666666/PLN-THRML) (reasoning, §6)
+and [ECAN-THRML](https://github.com/mafeifei666666/ECAN-THRML) (attention, §5.4),
+this completes the Hyperon-on-TSU trifecta.
+
 <details>
 <summary><strong>New to Predictive Coding? (30-second primer)</strong></summary>
 
@@ -85,13 +89,26 @@ TSU hardware supports ~12 neighbors per node. Wavelets fit; dense doesn't.
 | §7.4.3 | Wavelet PC replacing backprop, bidirectional local message passing | ✓ |
 | §7.4.1 | PathMap storage layer | ✗ (MORK software layer, not TSU) |
 
-### Completing the Hyperon-on-TSU trifecta
+### The hardware–algorithm pairing argument
 
-| Component | Project | Whitepaper § | TSU mechanism |
-|-----------|---------|--------------|---------------|
-| PLN reasoning | [PLN-THRML](https://github.com/mafeifei666666/PLN-THRML) ✓ | §6 | Beta-discretized factor graphs |
-| ECAN attention | [ECAN-THRML](https://github.com/mafeifei666666/ECAN-THRML) ✓ | §5.4 | Lattice Boltzmann |
-| QuantiMORK neural | **QuantiMORK-THRML** ✓ | §7.4 | Wavelet factor graphs |
+The AI industry is locked into the GPU + Backprop pairing — it's
+extremely efficient, but carries a structural limitation: global
+gradients update all parameters simultaneously, making continual
+learning difficult (catastrophic forgetting).
+
+|              | Backprop (global) | PC (local)          |
+|--------------|:-----------------:|:-------------------:|
+| **GPU**      | ✓ natural match   | △ simulating locality |
+| **TSU**      | ✗ structural mismatch | ✓ natural match |
+
+TSU's value is not "replacing GPUs" — it's making Predictive Coding
+a first-class citizen. PC's local Hebbian updates map directly onto
+TSU's sparse physical connections, just as matrix multiplication maps
+directly onto GPU's SIMD architecture.
+
+This project is a proof-of-concept for the TSU + PC cell of this
+matrix: wavelet-sparse predictive coding that compiles to TSU factor
+graphs.
 
 ### Why wavelets, not dense layers
 
