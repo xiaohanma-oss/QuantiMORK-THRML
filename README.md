@@ -32,7 +32,7 @@ wavelet coefficient node has ≤5 connections — well within TSU's ~12-neighbor
 hardware limit. The architecture implements Hyperon whitepaper §7.4
 (QuantiMORK), and uses iCog-Labs' PC-Transformers as the baseline.
 
-Whitepaper §7.4.3:
+Hyperon Whitepaper §7.4.3:
 > "Each level of the wavelet hierarchy maintains local predictions and
 > errors. Updates flow bidirectionally through local message passing
 > rather than requiring a global backward pass."
@@ -43,9 +43,11 @@ as a baseline, replaces its dense MLP layers with Haar wavelet-sparse
 wavelet-sparse variant (a) produces comparable language modeling results,
 and (b) maps to thrml factor graphs for TSU execution.
 
-Together with [PLN-THRML](https://github.com/xiaohanma-oss/PLN-THRML) (reasoning, §6)
-and [ECAN-THRML](https://github.com/xiaohanma-oss/ECAN-THRML) (attention, §5.4),
-this completes the Hyperon-on-TSU trifecta.
+Together with [PLN-THRML](https://github.com/xiaohanma-oss/PLN-THRML) (reasoning, §6),
+[ECAN-THRML](https://github.com/xiaohanma-oss/ECAN-THRML) (attention, §5.4),
+[MOSES-THRML](https://github.com/xiaohanma-oss/MOSES-THRML) (program evolution),
+and [Geodesic-THRML](https://github.com/xiaohanma-oss/Geodesic-THRML) (unified scheduler),
+this forms the Hyperon-on-TSU compilation suite.
 
 <details>
 <summary><strong>New to Predictive Coding? (30-second primer)</strong></summary>
@@ -93,17 +95,50 @@ TSU hardware supports ~12 neighbors per node. Wavelets fit; dense doesn't.
 
 ## Why this matters
 
-### The hardware–algorithm pairing argument
+### The closed-loop problem: why PC can't scale on GPUs
 
-The AI industry is locked into the GPU + Backprop pairing — it's
-extremely efficient, but carries a structural limitation: global
-gradients update all parameters simultaneously, making continual
-learning difficult (catastrophic forgetting).
+<details>
+<summary><strong>Backprop, forgetting, and why PC helps (30-second version)</strong></summary>
 
-|              | Backprop (global) | PC (local)          |
-|--------------|:-----------------:|:-------------------:|
-| **GPU**      | ✓ natural match   | △ simulating locality |
-| **TSU**      | ✗ structural mismatch | ✓ natural match |
+Backpropagation is a DAG (directed acyclic graph) computation: the chain
+rule propagates a single global error signal from output to input, and
+every weight receives a gradient that depends on the entire graph. This
+is extremely efficient on GPU hardware (which executes DAGs natively),
+but carries a structural consequence: global gradients update shared
+representations without inherent protection, so training on a new task
+overwrites weights that previous tasks depend on — **catastrophic
+forgetting**. Mitigations exist (EWC, PackNet), but they are added
+constraints on top of a learning rule that does not naturally isolate
+parameters.
+
+Predictive coding changes the default: higher layers predict lower
+layers, each layer computes local prediction error, and only locally
+involved weights update. Combined with sparse activations — where
+inactive neurons' weights are untouched by Hebbian rules — this creates
+implicit parameter isolation across tasks. Continual learning becomes
+structurally favored rather than requiring external regularization,
+though not fully solved: additional mechanisms (lateral competition,
+complementary memory) are still needed at scale.
+
+</details>
+
+**Why PC can't compete on GPUs: two compounding costs.**
+
+Backpropagation traverses the network twice — one forward pass, one
+backward pass — and it's done. The chain rule gives every weight an
+exact gradient in a single traversal. PC has no such global formula:
+each layer only sees its immediate neighbors, so information must
+propagate through repeated local adjustments. A 3-layer network needs
+at least 3 iterations for the output error to ripple back to the input
+layer, and convergence typically requires more.
+
+This means PC must scan the entire network T times where backprop
+scans it twice:
+
+|              | Backprop (DAG computation) | PC (iterative cycle)      |
+|--------------|:--------------------------:|:-------------------------:|
+| **GPU (DAG hardware)**  | ✓ DAG on DAG    | △ cycle unrolled into DAG |
+| **TSU (cycle hardware)** | —              | ✓ cycle on cycle          |
 
 TSU's value is not "replacing GPUs" — it's making Predictive Coding
 a first-class citizen. PC's local Hebbian updates map directly onto
