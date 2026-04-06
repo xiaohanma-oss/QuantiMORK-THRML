@@ -4,8 +4,9 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-green.svg)](pyproject.toml)
 
-> Hyperon whitepaper §7.4 QuantiMORK — wavelet-sparse predictive coding
-> compiled to thermodynamic factor graphs.
+> Wavelet-sparse predictive coding compiled to thermodynamic factor graphs
+> for TSU execution — bridging [Hyperon/QuantiMORK](https://github.com/trueagi-io/hyperon) (§7.4)
+> and [Extropic/thrml](https://github.com/extropic-ai/thrml).
 > End-to-end verified on Tiny Shakespeare against
 > [iCog-Labs' PC-Transformers](https://github.com/iCog-Labs-Dev/PC-Transformers).
 
@@ -17,15 +18,19 @@
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Results](#results)
+- [API reference](#api-reference)
+- [Hyperon integration outlook](#hyperon-integration-outlook)
 - [Project structure](#project-structure)
 - [Contributing](#contributing)
 - [Acknowledgements](#acknowledgements)
 
 ## Overview
 
-QuantiMORK-THRML implements the wavelet predictive coding architecture
-described in Hyperon whitepaper §7.4, and demonstrates that it can run on
-Extropic's TSU (Thermodynamic Sampling Unit) via factor graph compilation.
+QuantiMORK-THRML compiles wavelet-sparse predictive coding layers into
+thrml factor graphs that run on Extropic's TSU via Gibbs sampling. Each
+wavelet coefficient node has ≤5 connections — well within TSU's ~12-neighbor
+hardware limit. The architecture implements Hyperon whitepaper §7.4
+(QuantiMORK), and uses iCog-Labs' PC-Transformers as the baseline.
 
 Whitepaper §7.4.3:
 > "Each level of the wavelet hierarchy maintains local predictions and
@@ -59,8 +64,9 @@ F = 0.5 × ||target − prediction||²  +  α × 0.5 × ||td − output||²  +  
 
 The Hebbian weight update combines both error signals in the wavelet domain:
 `Δw = lr × (bu_err + α·td_err) × input − lr × β × w`, where `α` (--td-alpha,
-default 0.5) controls the top-down contribution and `β` (--beta, default 0.1)
-controls KL regularization (weight decay toward zero under Gaussian prior).
+default 0.5) controls the top-down contribution and `β` (--beta, training
+default 0.1) controls KL regularization (weight decay toward zero under
+Gaussian prior; model-level default is 0.0, i.e. no KL unless explicitly set).
 
 PC-Transformers (iCog-Labs) implements this for transformers.
 QuantiMORK-THRML makes the MLP layers wavelet-sparse so they fit on TSU.
@@ -123,11 +129,14 @@ QuantiMORK WaveletLinear(512, 512, levels=3):
 ## Installation
 
 ```bash
-git clone https://github.com/xiaohanma-oss/QuantiMORK-THRML.git
+git clone --recurse-submodules https://github.com/xiaohanma-oss/QuantiMORK-THRML.git
 cd QuantiMORK-THRML
-git submodule update --init          # pull PC-Transformers baseline
 pip install -e ".[dev]"              # core + pytest
 ```
+
+> The [PC-Transformers](https://github.com/iCog-Labs-Dev/PC-Transformers) submodule
+> provides the baseline. If you cloned without `--recurse-submodules`, run
+> `git submodule update --init`.
 
 ## Quick start
 
@@ -200,7 +209,7 @@ top-down contribution (default 0.5; set 0 for bu-only baseline).
 
 Transformed coefficients are reconstructed back to the original dimension.
 
-### 4. PC energy → factor graph → Gibbs sampling (TSU)
+### 5. PC energy → factor graph → Gibbs sampling (TSU)
 
 ```
 Free energy:   F = E_pred + α × E_td + β × D_KL(q || prior)
@@ -257,6 +266,65 @@ with KL regularization. Verified by
 `test_wavelet_weights_update_after_forward` and
 `test_bidirectional_update_differs_from_bu_only`.
 
+## API reference
+
+### Haar transforms (`quantimork_thrml.haar`)
+
+| Function | Description |
+|----------|-------------|
+| `haar_dwt_1d(x, n_levels=3)` | 1D Haar DWT along last dimension; returns `{"details": [d_1, ..., d_L], "approx": a_L}` |
+| `haar_idwt_1d(coeffs)` | Inverse Haar DWT; reconstructs original tensor from coefficients dict |
+| `tree_positions(n_levels, n_features)` | Enumerates wavelet coefficient positions as `(level, band, size)` |
+
+### WaveletLinear (`quantimork_thrml.wavelet_linear`)
+
+| Method | Description |
+|--------|-------------|
+| `WaveletLinear(in_features, out_features, n_levels=3, bias=True)` | Multi-resolution linear layer; requires `in_features == out_features` |
+| `.forward(x)` | Haar DWT → per-level independent Linear → inverse Haar DWT |
+| `.num_params()` | Total trainable parameters across all per-level transforms |
+| `.max_connections_per_node()` | Maximum per-level Linear size (bounds TSU connectivity) |
+| `.extract_energy_params()` | Export per-level weights/biases as list of dicts for thrml factor graph construction |
+
+### WaveletPCTransformer (`quantimork_thrml.model`)
+
+| Method | Description |
+|--------|-------------|
+| `WaveletPCTransformer(config)` | PCTransformer with wavelet-sparse MLP; config: `n_embed`, `n_blocks`, `T`, `wavelet_n_levels`, `td_alpha`, `beta` |
+| `.register_all_lateral_weights()` | Register lateral weight tensors for all PC layers |
+| `.forward(target_ids, input_ids)` | Full PC forward pass over T inference steps; returns `(B, S, vocab_size)` logits |
+
+### Verification (`quantimork_thrml.thrml_verify`)
+
+These functions use JAX + thrml (not PyTorch) for factor graph verification.
+
+| Function | Description |
+|----------|-------------|
+| `build_single_level_graph(weight_matrix, input_act, target_act, ...)` | Build thrml factor graph for one WaveletLinear level with optional TD modulation and KL regularization |
+| `run_verification(graph, seed=0, n_batches=30)` | Run Gibbs sampling on factor graph; returns `{sampled_values, target_values, mse, sampled_energy}` |
+| `pc_prediction_weights(precision, k=16)` | K×K pairwise weight matrix encoding PC squared prediction error |
+| `td_modulation_weights(alpha, precision, k=16)` | K×K pairwise weight matrix encoding top-down modulation energy |
+| `kl_prior_weights(prior_probs, beta=0.1, k=16)` | [K] unary weight vector encoding KL divergence complexity penalty |
+| `coeff_bin_centers(k=16)` | K evenly-spaced bin centers for discretizing activations |
+| `value_to_bin(value, k=16)` / `bin_to_value(bin_idx, k=16)` | Quantize continuous scalar ↔ bin index |
+
+## Hyperon integration outlook
+
+See [PLN-THRML README](https://github.com/xiaohanma-oss/PLN-THRML#hyperon-integration-outlook)
+for the full heterogeneous pipeline design (Control → Compile → Sample).
+
+This project contributes the **learning tier**: wavelet-sparse predictive coding
+compiled to TSU factor graphs, handling perceptual learning alongside PLN's
+Boltzmann factor-graph inference and ECAN's LBM attention diffusion. All three
+workloads are TSU-native — co-location on one chip via time-multiplexing or
+spatial partitioning is an open question (depends on factor graph size, lattice
+partitioning, and mixing time).
+
+The key architectural difference from standard PC: QuantiMORK's wavelet
+decomposition limits each coefficient node to ≤5 neighbors, fitting within
+TSU's ~12-neighbor hardware constraint. Dense PC layers (512+ connections)
+would require multi-chip partitioning for even a single layer.
+
 ## Project structure
 
 ```
@@ -270,10 +338,12 @@ scripts/
 ├── train.py              # Train wavelet or baseline model
 └── compare.py            # Print comparison table
 tests/
+├── conftest.py           # Shared fixtures and tolerances
 ├── test_haar.py          # Haar roundtrip + coefficient correctness
 ├── test_wavelet_linear.py # Shape, params, gradients
 ├── test_model.py         # Forward pass smoke test
-└── test_thrml_verify.py  # TSU factor graph energy equivalence
+├── test_thrml_verify.py  # TSU factor graph energy equivalence
+└── test_baseline_compare.py # Wavelet vs dense regression comparison
 vendor/
 └── PC-Transformers/      # iCog-Labs baseline (git submodule)
 ```
@@ -298,3 +368,7 @@ Five projects compiling Hyperon's cognitive architecture to thermodynamic hardwa
 
 - [PC-Transformers](https://github.com/iCog-Labs-Dev/PC-Transformers) — iCog Labs
 - [thrml](https://github.com/extropic-ai/thrml) — Extropic AI factor graph library
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Xiaohan Ma
