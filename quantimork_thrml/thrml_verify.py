@@ -63,6 +63,53 @@ def pc_prior_weights(mean, precision, k=DEFAULT_K, lo=-1.0, hi=1.0):
     return W
 
 
+def td_modulation_weights(alpha, precision, k=DEFAULT_K, lo=-1.0, hi=1.0):
+    """K×K pairwise weight matrix encoding top-down modulation energy.
+
+    W[i,j] = -alpha * 0.5 * precision * (center_i - center_j)²
+
+    Models the additional energy from the top-down prediction signal:
+    E_td = alpha * 0.5 * precision * ||output - td_prediction||²
+    """
+    centers = coeff_bin_centers(k, lo, hi)
+    diff = centers[:, None] - centers[None, :]
+    W = -alpha * 0.5 * precision * diff ** 2
+    W = W - jnp.mean(W)
+    return W
+
+
+def gaussian_prior_probs(mean=0.0, std=1.0, k=DEFAULT_K, lo=-1.0, hi=1.0):
+    """Discretized Gaussian prior probability over k bins.
+
+    Returns normalized probabilities P(bin_j) ∝ exp(-0.5 * ((c_j - mean)/std)²).
+    """
+    centers = coeff_bin_centers(k, lo, hi)
+    log_probs = -0.5 * ((centers - mean) / std) ** 2
+    probs = jnp.exp(log_probs - jax.scipy.special.logsumexp(log_probs))
+    return probs
+
+
+def kl_prior_weights(prior_probs, beta=0.1, k=DEFAULT_K):
+    """[K] unary weight vector encoding KL divergence prior.
+
+    In the energy-based model, the factor weight for bin j is:
+        W[j] = beta * log(p_j)
+    This encodes D_KL(q || prior) as the variational free energy's
+    complexity penalty: bins with low prior probability get large
+    negative energy (penalized), while likely bins get near-zero penalty.
+
+    Args:
+        prior_probs: (k,) array of prior probabilities (must sum to ~1)
+        beta: KL strength (default 0.1)
+        k: number of bins
+    """
+    prior_probs = jnp.clip(prior_probs, 1e-8, None)
+    prior_probs = prior_probs / prior_probs.sum()
+    W = beta * jnp.log(prior_probs)
+    W = W - jnp.mean(W)
+    return W
+
+
 def value_to_bin(value, k=DEFAULT_K, lo=-1.0, hi=1.0):
     """Quantize continuous value to nearest bin index."""
     centers = coeff_bin_centers(k, lo, hi)
@@ -77,16 +124,22 @@ def bin_to_value(bin_idx, k=DEFAULT_K, lo=-1.0, hi=1.0):
 def build_single_level_graph(
     weight_matrix, input_activations, target_activations,
     precision=DEFAULT_PRECISION, k=DEFAULT_K,
+    td_activations=None, td_alpha=0.0,
+    beta=0.0,
 ):
     """Build factor graph for one level of WaveletLinear.
 
-    Models the PC energy: E = 0.5 * precision * ||target - W @ input||²
+    Models the variational free energy:
+        F = 0.5 * precision * ||target - W @ input||²
+          + td_alpha * 0.5 * ||output - td||²
+          + beta * D_KL(q || prior)
 
     For a small subset of dimensions (to keep tractable), creates:
     - Input nodes (clamped to observed activations)
     - Output nodes (free, to be sampled)
     - Pairwise factors encoding W[i,j] relationship
     - Prior factors on output nodes
+    - Top-down modulation factors (if td_activations provided)
 
     Args:
         weight_matrix: (out_dim, in_dim) numpy array — the Linear weight
@@ -94,6 +147,9 @@ def build_single_level_graph(
         target_activations: (out_dim,) numpy array — expected output
         precision: PC energy precision
         k: Number of discretization bins
+        td_activations: (out_dim,) numpy array — top-down predictions, or None
+        td_alpha: Weight for top-down modulation (default 0.0 = disabled)
+        beta: KL divergence strength (default 0.0 = use legacy Gaussian prior)
 
     Returns:
         Dict with graph components + metadata for verification.
@@ -109,6 +165,8 @@ def build_single_level_graph(
 
     # Determine value range from activations
     all_vals = list(input_activations[:max_nodes]) + list(target_activations[:max_nodes])
+    if td_activations is not None:
+        all_vals += list(td_activations[:max_nodes])
     lo = float(min(all_vals)) - 0.5
     hi = float(max(all_vals)) + 0.5
 
@@ -126,13 +184,32 @@ def build_single_level_graph(
                 W[None, :, :],
             ))
 
-    # Prior factors on output nodes (centered at target)
+    # Prior factors on output nodes
     for i in range(max_nodes):
-        W = pc_prior_weights(
-            float(target_activations[i]), precision * 0.1, k, lo, hi)
+        if beta > 0:
+            # KL-based prior: variational free energy complexity penalty
+            prior_probs = gaussian_prior_probs(
+                mean=float(target_activations[i]), std=0.5, k=k, lo=lo, hi=hi)
+            W = kl_prior_weights(prior_probs, beta=beta, k=k)
+        else:
+            # Legacy Gaussian prior (backward compatible)
+            W = pc_prior_weights(
+                float(target_activations[i]), precision * 0.1, k, lo, hi)
         factors.append(CategoricalEBMFactor(
             [Block([output_nodes[i]])], W[None, :],
         ))
+
+    # Top-down modulation factors: output[i] ← td_node[i]
+    td_nodes = []
+    if td_activations is not None and td_alpha > 0:
+        for i in range(max_nodes):
+            td_node = CategoricalNode()
+            td_nodes.append(td_node)
+            W_td = td_modulation_weights(td_alpha, precision, k, lo, hi)
+            factors.append(SquareCategoricalEBMFactor(
+                [Block([output_nodes[i]]), Block([td_node])],
+                W_td[None, :, :],
+            ))
 
     # Clamp input nodes
     clamped_state = {}
@@ -140,9 +217,15 @@ def build_single_level_graph(
         clamped_state[node] = value_to_bin(
             float(input_activations[j]), k, lo, hi)
 
+    # Clamp td nodes
+    for j, node in enumerate(td_nodes):
+        clamped_state[node] = value_to_bin(
+            float(td_activations[j]), k, lo, hi)
+
     # Free blocks: output nodes
     free_blocks = [Block(output_nodes)]
-    clamped_blocks = [Block(input_nodes)]
+    all_clamped = input_nodes + td_nodes
+    clamped_blocks = [Block(all_clamped)] if all_clamped else [Block(input_nodes)]
 
     spec = BlockGibbsSpec(free_blocks, clamped_blocks)
     sampler = CategoricalGibbsConditional(n_categories=k)

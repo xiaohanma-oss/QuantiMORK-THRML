@@ -109,3 +109,39 @@ class TestWaveletPCTransformerForward:
             "No wavelet weights changed after forward pass — "
             "Hebbian PC update is not reaching per-level weights"
         )
+
+    def test_bidirectional_update_differs_from_bu_only(self, config):
+        """Bidirectional (bu+td) Hebbian update must differ from bu-only."""
+        from quantimork_thrml.model import _WaveletLinearProxy
+        from quantimork_thrml.wavelet_linear import WaveletLinear
+
+        torch.manual_seed(42)
+        wl = WaveletLinear(128, 128, n_levels=3)
+        proxy = _WaveletLinearProxy(wl, "forward")
+
+        x = torch.randn(2, 4, 128)
+        bu_err = torch.randn(2, 4, 128)
+        td_err = torch.randn(2, 4, 128)
+
+        # Snapshot original weights
+        orig = [dt.weight.data.clone() for dt in wl.detail_transforms]
+
+        # bu-only update
+        proxy(x)  # cache input
+        proxy.apply_hebbian_update(bu_err, 0.001)
+        after_bu = [dt.weight.data.clone() for dt in wl.detail_transforms]
+
+        # Reset weights
+        for dt, o in zip(wl.detail_transforms, orig):
+            dt.weight.data.copy_(o)
+
+        # bidirectional update
+        proxy(x)  # re-cache input
+        proxy.apply_hebbian_update(bu_err, 0.001, td_err=td_err, td_alpha=0.5)
+        after_bidir = [dt.weight.data.clone() for dt in wl.detail_transforms]
+
+        any_diff = any(
+            not torch.equal(a, b) for a, b in zip(after_bu, after_bidir))
+        assert any_diff, (
+            "Bidirectional update should produce different weights than bu-only"
+        )

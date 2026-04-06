@@ -94,6 +94,8 @@ def make_config(mode="wavelet", num_epochs=5):
     )
     if mode == "wavelet":
         config.wavelet_n_levels = 3
+        config.td_alpha = 0.5
+        config.beta = 0.1
     return config
 
 
@@ -155,10 +157,23 @@ def train_epoch(model, dataloader, config, global_step, device):
         total_energy += avg_energy
         batch_count += 1
 
+        # KL energy component (weight decay penalty)
+        kl_energy = 0.0
+        beta = getattr(config, "beta", 0.0)
+        if beta > 0 and hasattr(model, "_beta"):
+            for block in model.blocks:
+                wl = block.mlp.wavelet
+                for dt in wl.detail_transforms:
+                    kl_energy += beta * 0.5 * float(dt.weight.data.pow(2).sum())
+                kl_energy += beta * 0.5 * float(
+                    wl.approx_transform.weight.data.pow(2).sum())
+
         if (batch_idx + 1) % 20 == 0:
             ppl = math.exp(ce_loss.item()) if ce_loss.item() < 100 else float("inf")
+            kl_str = f" KL={kl_energy:.4f}" if kl_energy > 0 else ""
             print(f"  batch {batch_idx+1}/{len(dataloader)} | "
-                  f"CE={ce_loss.item():.4f} PPL={ppl:.1f} energy={avg_energy:.4f}")
+                  f"CE={ce_loss.item():.4f} PPL={ppl:.1f} "
+                  f"energy={avg_energy:.4f}{kl_str}")
 
     avg_ce = total_ce_loss / max(batch_count, 1)
     avg_e = total_energy / max(batch_count, 1)
@@ -172,12 +187,19 @@ def main():
                         default="wavelet")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--td-alpha", type=float, default=0.5,
+                        help="Top-down error weight for bidirectional Hebbian update")
+    parser.add_argument("--beta", type=float, default=0.1,
+                        help="KL divergence regularization strength")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cpu")
 
     config = make_config(args.mode, args.epochs)
+    if args.mode == "wavelet":
+        config.td_alpha = args.td_alpha
+        config.beta = args.beta
     model = build_model(config, args.mode).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())

@@ -53,8 +53,14 @@ updates locally. No global backward pass needed.
 
 The energy being minimized at each layer:
 ```
-E = 0.5 × ||target − prediction||²
+F = 0.5 × ||target − prediction||²  +  α × 0.5 × ||td − output||²  +  β × D_KL(q || prior)
+         (bottom-up error)             (top-down modulation)         (complexity penalty)
 ```
+
+The Hebbian weight update combines both error signals in the wavelet domain:
+`Δw = lr × (bu_err + α·td_err) × input − lr × β × w`, where `α` (--td-alpha,
+default 0.5) controls the top-down contribution and `β` (--beta, default 0.1)
+controls KL regularization (weight decay toward zero under Gaussian prior).
 
 PC-Transformers (iCog-Labs) implements this for transformers.
 QuantiMORK-THRML makes the MLP layers wavelet-sparse so they fit on TSU.
@@ -80,14 +86,6 @@ TSU hardware supports ~12 neighbors per node. Wavelets fit; dense doesn't.
 </details>
 
 ## Why this matters
-
-### What this implements (whitepaper §7.4)
-
-| Section | Content | Status |
-|---------|---------|--------|
-| §7.4.2 | Wavelet coefficients keyed by (level, band, position), per-level selective computation | ✓ |
-| §7.4.3 | Wavelet PC replacing backprop, bidirectional local message passing | ✓ |
-| §7.4.1 | PathMap storage layer | ✗ (MORK software layer, not TSU) |
 
 ### The hardware–algorithm pairing argument
 
@@ -181,19 +179,22 @@ Level 3: Linear(64, 64)    →   4K params  (×2: detail + approx)
 Total: ~90K params  (vs 262K dense)
 ```
 
-### 3. Wavelet-domain Hebbian update (gradient-free)
+### 3. Bidirectional wavelet-domain Hebbian update (gradient-free)
 
-PC-Transformers uses Hebbian-like local learning (not backprop):
-`Δw = lr × (prediction_error × input)`. Since the Haar DWT is orthogonal,
-this full-space Hebbian delta decomposes exactly into per-level updates:
+PC-Transformers uses Hebbian-like local learning (not backprop). QuantiMORK
+extends this with **bidirectional free energy**: both bottom-up prediction
+error and top-down modulation from the layer above drive weight updates.
+Since the Haar DWT is orthogonal, the combined error decomposes exactly:
 
 ```
-Δw_level_i = lr × DWT(error)_i × DWT(input)_i^T
+combined_err_i = DWT(bu_err)_i + α × DWT(td_err)_i
+Δw_level_i = lr × combined_err_i × DWT(input)_i^T
 ```
 
 Each level's `nn.Linear` weights are updated independently in the wavelet
 coefficient space — no global gradient flow, consistent with ActPC
-(Goertzel 2024, arXiv:2412.16547).
+(Goertzel 2024, arXiv:2412.16547). The `--td-alpha` flag controls the
+top-down contribution (default 0.5; set 0 for bu-only baseline).
 
 ### 4. Inverse Haar DWT → output
 
@@ -202,8 +203,10 @@ Transformed coefficients are reconstructed back to the original dimension.
 ### 4. PC energy → factor graph → Gibbs sampling (TSU)
 
 ```
-PC energy:     E = 0.5 × ||target − prediction||²
-Factor weight: W[i,j] = −0.5 × precision × (center_i − center_j)²
+Free energy:   F = E_pred + α × E_td + β × D_KL(q || prior)
+Prediction:    W[i,j] = −0.5 × precision × (center_i − center_j)²
+TD modulation: W_td[i,j] = −α × 0.5 × precision × (center_i − center_j)²
+KL prior:      W_kl[j] = β × log(prior_j)   (Gaussian discretized on k bins)
 Execution:     Gibbs sampling on CategoricalNode factor graph
 ```
 
@@ -221,31 +224,38 @@ Execution:     Gibbs sampling on CategoricalNode factor graph
 
 Tiny Shakespeare, 5 epochs, n_embed=128, n_blocks=4, T=2, CPU training:
 
-| Metric | PC-Transformers | QuantiMORK-THRML |
-|--------|:---------------:|:----------------:|
+| Metric | PC-Transformers | QuantiMORK (td_alpha=0.5, beta=0.1) |
+|--------|:---------------:|:-----------------------------------:|
 | Parameters | 1.06M | 0.56M |
 | MLP params/layer | dense | 90K (wavelet) |
 | Max connections/node | 512 | ≤5 |
 | Final train PPL | 954.9 | 963.7 |
 | Final val PPL | 952.8 | 956.7 |
-| Final train energy | 1.3762 | 1.5974 |
-| Final val energy | 1.3761 | 1.5917 |
+| Final train energy | 1.3762 | 1.6966 |
+| Final val energy | 1.3761 | 1.6969 |
+| Final KL energy | — | 0.1885 |
 | Parameter compression | — | 1.9× |
 | TSU deployable | ✗ | ✓ |
 
-Val perplexity difference is <1% — wavelet sparsification preserves PC
-learning quality while reducing connectivity to TSU-compatible levels.
+Val perplexity difference is <1% — bidirectional wavelet-sparse PC
+preserves language modeling quality while reducing connectivity to
+TSU-compatible levels.
 
-Energy is higher for the wavelet model (~16%) because per-level
+Energy is higher for the wavelet model (~23%) because (a) per-level
 independent Linears produce less precise predictions than a single
-dense layer, but the gap does not affect downstream task quality.
+dense layer, and (b) KL regularization adds a complexity penalty. The
+KL component decreases over training (0.55 → 0.19), indicating the
+model learns to match its Gaussian prior. The gap does not affect
+downstream task quality.
 
 Parameter compression: 1.9× (MLP-only compression is ~2.9×; attention
 layers are shared and dominate total count at this small scale).
 
-Wavelet per-level weights are trained via wavelet-domain Hebbian updates
-(DWT-decomposed prediction error × DWT-decomposed input), verified by
-`test_wavelet_weights_update_after_forward`.
+Wavelet per-level weights are trained via bidirectional wavelet-domain
+Hebbian updates (combined bottom-up + top-down error in DWT domain),
+with KL regularization. Verified by
+`test_wavelet_weights_update_after_forward` and
+`test_bidirectional_update_differs_from_bu_only`.
 
 ## Project structure
 
@@ -272,9 +282,19 @@ vendor/
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Sister Projects
+
+Five projects compiling Hyperon's cognitive architecture to thermodynamic hardware:
+
+| Project | What it compiles |
+|---------|-----------------|
+| [PLN-THRML](https://github.com/xiaohanma-oss/PLN-THRML) | Probabilistic inference → Boltzmann energy tables |
+| [ECAN-THRML](https://github.com/xiaohanma-oss/ECAN-THRML) | Attention diffusion → Lattice Boltzmann simulation |
+| [MOSES-THRML](https://github.com/xiaohanma-oss/MOSES-THRML) | Program evolution → Boltzmann sampling |
+| **[QuantiMORK-THRML](https://github.com/xiaohanma-oss/QuantiMORK-THRML)** | **Predictive coding → wavelet-sparse factor graphs** |
+| [Geodesic-THRML](https://github.com/xiaohanma-oss/Geodesic-THRML) | Unified geodesic scheduler for all above |
+
 ## Acknowledgements
 
-- [iCog-Labs](https://github.com/iCog-Labs-Dev) — PC-Transformers baseline
-- [Extropic](https://extropic.ai) — thrml library and TSU architecture
-- [Hyperon/PRIMUS whitepaper](https://github.com/trueagi-io/hyperon-experimental) — §7.4 QuantiMORK design
-- Goertzel (2024) — [ActPC-Chem](https://arxiv.org/abs/2412.16547): theoretical framework for discrete Active Predictive Coding
+- [PC-Transformers](https://github.com/iCog-Labs-Dev/PC-Transformers) — iCog Labs
+- [thrml](https://github.com/extropic-ai/thrml) — Extropic AI factor graph library

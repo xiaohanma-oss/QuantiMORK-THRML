@@ -113,16 +113,29 @@ class _WaveletLinearProxy(nn.Module):
         self._cached_input = x.detach()
         return self.wavelet_linear(x)
 
-    def apply_hebbian_update(self, bu_err, local_lr):
+    def apply_hebbian_update(self, bu_err, local_lr, td_err=None, td_alpha=0.5,
+                             beta=0.0):
         """Apply wavelet-domain Hebbian update to per-level weights.
 
         Since Haar DWT is orthogonal, the full-space Hebbian delta
         delta_W = lr * (bu_err^T @ x_input) decomposes exactly:
             delta_level_i = lr * DWT(bu_err)_i^T @ DWT(x_input)_i
 
+        When td_err is provided, the combined error at each wavelet level is:
+            combined_i = bu_err_i + td_alpha * td_err_i
+        This implements bidirectional free energy: bottom-up prediction error
+        plus top-down modulation from the layer above.
+
+        When beta > 0, a KL regularization penalty (weight decay toward zero)
+        is applied: for Gaussian prior N(0, σ²), ∇_w D_KL ∝ w, so the
+        penalty is simply beta * w.
+
         Args:
             bu_err: Bottom-up prediction error from PCLayer, shape (B, S, D).
             local_lr: PC local learning rate.
+            td_err: Top-down error from pc_layer2, shape (B, S, D), or None.
+            td_alpha: Weight for top-down error contribution (default 0.5).
+            beta: KL divergence regularization strength (default 0.0).
         """
         if self._cached_input is None:
             return
@@ -131,31 +144,52 @@ class _WaveletLinearProxy(nn.Module):
         wavelet_input = haar_dwt_1d(self._cached_input, n_levels)
         wavelet_err = haar_dwt_1d(bu_err, n_levels)
 
+        # Combine bu_err with td_err in wavelet domain
+        if td_err is not None and td_alpha > 0:
+            wavelet_td = haar_dwt_1d(td_err, n_levels)
+            combined_details = [
+                wavelet_err["details"][i] + td_alpha * wavelet_td["details"][i]
+                for i in range(n_levels)
+            ]
+            combined_approx = (
+                wavelet_err["approx"] + td_alpha * wavelet_td["approx"])
+        else:
+            combined_details = wavelet_err["details"]
+            combined_approx = wavelet_err["approx"]
+
         with torch.no_grad():
             for i, dt in enumerate(self.wavelet_linear.detail_transforms):
                 delta = local_lr * torch.einsum(
                     "bsv, bsh -> vh",
-                    wavelet_err["details"][i],
+                    combined_details[i],
                     wavelet_input["details"][i])
                 delta = torch.clamp(delta, -0.01, 0.01)
                 dt.weight.data.add_(delta)
                 if dt.bias is not None:
-                    delta_b = local_lr * wavelet_err["details"][i].mean(
+                    delta_b = local_lr * combined_details[i].mean(
                         dim=(0, 1))
                     delta_b = torch.clamp(delta_b, -0.01, 0.01)
                     dt.bias.data.add_(delta_b)
+                # KL regularization: ∇_w D_KL = beta * w (Gaussian prior)
+                if beta > 0:
+                    kl_penalty = torch.clamp(beta * dt.weight.data, -0.01, 0.01)
+                    dt.weight.data.add_(-local_lr * kl_penalty)
 
             at = self.wavelet_linear.approx_transform
             delta_a = local_lr * torch.einsum(
                 "bsv, bsh -> vh",
-                wavelet_err["approx"],
+                combined_approx,
                 wavelet_input["approx"])
             delta_a = torch.clamp(delta_a, -0.01, 0.01)
             at.weight.data.add_(delta_a)
             if at.bias is not None:
-                delta_b = local_lr * wavelet_err["approx"].mean(dim=(0, 1))
+                delta_b = local_lr * combined_approx.mean(dim=(0, 1))
                 delta_b = torch.clamp(delta_b, -0.01, 0.01)
                 at.bias.data.add_(delta_b)
+            # KL regularization for approx level
+            if beta > 0:
+                kl_penalty = torch.clamp(beta * at.weight.data, -0.01, 0.01)
+                at.weight.data.add_(-local_lr * kl_penalty)
 
         # Reset proxy weight (discard step_linear's spurious delta)
         self._proxy_weight.copy_(torch.eye(
@@ -204,6 +238,8 @@ class WaveletPCTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self._td_alpha = getattr(config, "td_alpha", 0.5)
+        self._beta = getattr(config, "beta", 0.0)
         self.embedding = Embedding_Layer(config)
         self.blocks = nn.ModuleList(
             [WaveletTransformerBlock(config) for _ in range(config.n_blocks)])
@@ -388,12 +424,17 @@ class WaveletPCTransformer(nn.Module):
             synchronize_execution(use_cuda, streams_or_futures)
 
             # Apply wavelet-domain Hebbian updates (replaces step_linear's
-            # spurious identity-matrix update with correct per-level updates)
+            # spurious identity-matrix update with correct per-level updates).
+            # Bidirectional: combine bu_err (from pc_layer1) with td_err
+            # (from pc_layer2, the layer above) for richer gradient signal.
             for block in self.blocks:
                 bu_err = block.mlp.pc_layer1._error_cache.get("fc1")
                 if bu_err is not None:
+                    td_err = block.mlp.pc_layer2._error_cache.get("fc2")
                     block.mlp.fc1.apply_hebbian_update(
-                        bu_err, block.mlp.pc_layer1.local_lr)
+                        bu_err, block.mlp.pc_layer1.local_lr,
+                        td_err=td_err, td_alpha=self._td_alpha,
+                        beta=self._beta)
 
         logits = self.output.pc_layer.get_mu("linear_output")
         return logits
