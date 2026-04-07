@@ -1,8 +1,3 @@
-# Claude Code (local configuration)
-CLAUDE.md
-.claude/
-.mcp.json
-
 __pycache__/
 *.py[cod]
 *.egg-info/
