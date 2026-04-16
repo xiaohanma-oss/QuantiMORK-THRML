@@ -5,11 +5,13 @@ Implements whitepaper §7.4.2 + §7.4.3: replace dense nn.Linear with
 Haar DWT → per-level independent small Linear → Inverse Haar.
 
 Each level's Linear only connects coefficients within that level,
-giving tree-local connectivity (max ~5 neighbors per node) instead of
-dense connectivity (512+ neighbors). This satisfies TSU's ~12 neighbor limit.
+giving tree-local inter-level connectivity (max ~5 neighbors per node).
+However, per-level Linear layers are dense within each level
+(up to 256 intra-level connections at level 1), exceeding TSU's
+~12 neighbor limit. See scripts/connectivity_analysis.py for details.
 
     Dense nn.Linear(512, 512):  262,144 params, 512 connections/node
-    WaveletLinear(512, 512, 3): ~85K params, ≤5 connections/node
+    WaveletLinear(512, 512, 3): ~85K params, ≤5 inter-level + dense intra-level
 """
 
 import torch

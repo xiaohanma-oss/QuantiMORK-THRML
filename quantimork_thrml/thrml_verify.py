@@ -126,6 +126,7 @@ def build_single_level_graph(
     precision=DEFAULT_PRECISION, k=DEFAULT_K,
     td_activations=None, td_alpha=0.0,
     beta=0.0,
+    backend="categorical",
 ):
     """Build factor graph for one level of WaveletLinear.
 
@@ -146,14 +147,24 @@ def build_single_level_graph(
         input_activations: (in_dim,) numpy array — observed input
         target_activations: (out_dim,) numpy array — expected output
         precision: PC energy precision
-        k: Number of discretization bins
+        k: Number of discretization bins (categorical backend only)
         td_activations: (out_dim,) numpy array — top-down predictions, or None
         td_alpha: Weight for top-down modulation (default 0.0 = disabled)
         beta: KL divergence strength (default 0.0 = use legacy Gaussian prior)
+        backend: "categorical" (K-bin p-dit) or "pmode" (continuous Gaussian)
 
     Returns:
         Dict with graph components + metadata for verification.
     """
+    if backend == "pmode":
+        from quantimork_thrml.pmode_verify import build_pmode_level_graph
+        return build_pmode_level_graph(
+            weight_matrix, input_activations, target_activations,
+            precision=precision,
+            td_activations=td_activations, td_alpha=td_alpha,
+            beta=beta,
+        )
+
     out_dim, in_dim = weight_matrix.shape
 
     # For tractability, use a small subset
@@ -260,6 +271,19 @@ def run_verification(graph, seed=0, n_batches=DEFAULT_N_BATCHES,
     Returns:
         Dict with sampled_values, sampled_energy, target_energy, mse.
     """
+    if "k" not in graph:
+        # p-mode graph — delegate to pmode_verify
+        from quantimork_thrml.pmode_verify import (
+            run_pmode_verification,
+            DEFAULT_N_BATCHES as PMODE_N_BATCHES,
+            DEFAULT_SCHEDULE as PMODE_SCHEDULE,
+        )
+        return run_pmode_verification(
+            graph, seed=seed,
+            n_batches=PMODE_N_BATCHES,
+            schedule=PMODE_SCHEDULE,
+        )
+
     k = graph["k"]
     spec = graph["spec"]
     prog = graph["program"]

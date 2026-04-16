@@ -27,10 +27,12 @@
 ## Overview
 
 QuantiMORK-THRML compiles wavelet-sparse predictive coding layers into
-thrml factor graphs that run on Extropic's TSU via Gibbs sampling. Each
-wavelet coefficient node has ≤5 connections — well within TSU's ~12-neighbor
-hardware limit. The architecture implements Hyperon whitepaper §7.4
-(QuantiMORK), and uses iCog-Labs' PC-Transformers as the baseline.
+thrml factor graphs that run on Extropic's TSU via Gibbs sampling. The
+wavelet decomposition reduces inter-level connectivity to a tree structure
+(≤5 inter-level neighbors), but per-level Linear layers remain dense
+(see [Connectivity & Sparsity](#connectivity--sparsity)). The architecture
+implements Hyperon whitepaper §7.4 (QuantiMORK), and uses iCog-Labs'
+PC-Transformers as the baseline.
 
 Hyperon Whitepaper §7.4.3:
 > "Each level of the wavelet hierarchy maintains local predictions and
@@ -87,9 +89,10 @@ like looking at a photo from far away (coarse) and up close (fine detail).
 - Difference = fine detail
 - Repeat on the coarse part → tree of coefficients
 
-Key property: each coefficient connects to at most **5 neighbors**
-(parent, 2 children, 2 siblings). A dense layer connects to **512+**.
-TSU hardware supports ~12 neighbors per node. Wavelets fit; dense doesn't.
+Key property: the wavelet tree gives each coefficient at most **5 inter-level
+neighbors** (parent, 2 children, 2 siblings). But each per-level Linear
+connects coefficients *within* a level — those connections are still dense.
+See [Connectivity & Sparsity](#connectivity--sparsity) for measured data.
 
 </details>
 
@@ -157,8 +160,9 @@ PC-Transformers MLP: nn.Linear(512, 2048)
   → TSU limit: ~12 neighbors → ✗
 
 QuantiMORK WaveletLinear(512, 512, levels=3):
-  → 90K params, ≤5 connections per node
-  → TSU limit: ~12 neighbors → ✓
+  → 90K params, ≤5 inter-level connections per node
+  → per-level intra-level: 256/128/64 connections (still dense)
+  → TSU deployment requires per-level sparsification (open question)
 ```
 
 ## Installation
@@ -246,23 +250,35 @@ Transformed coefficients are reconstructed back to the original dimension.
 
 ### 5. PC energy → factor graph → Gibbs sampling (TSU)
 
+Two factor graph backends are available:
+
+**Categorical backend** (K=16 p-dit discretization):
 ```
-Free energy:   F = E_pred + α × E_td + β × D_KL(q || prior)
-Prediction:    W[i,j] = −0.5 × precision × (center_i − center_j)²
-TD modulation: W_td[i,j] = −α × 0.5 × precision × (center_i − center_j)²
-KL prior:      W_kl[j] = β × log(prior_j)   (Gaussian discretized on k bins)
-Execution:     Gibbs sampling on CategoricalNode factor graph
+W[i,j] = −0.5 × precision × (center_i − center_j)²   (K×K lookup table)
+Execution: Gibbs sampling on CategoricalNode factor graph
 ```
+
+**P-mode backend** (continuous Gaussian, recommended):
+```
+E(x) = 0.5 × (x − μ)ᵀ A (x − μ)                     (quadratic energy)
+     = 0.5 × Σ_i A_ii x_i² + Σ_i b_i x_i              (with input clamped)
+Execution: Gibbs sampling on ContinuousNode factor graph
+```
+
+Under the Laplace approximation (Active Inference §4.19, Box 4.3), PC
+energy is naturally quadratic — the p-mode backend encodes it exactly
+without discretization error. Software Gibbs validates energy equivalence;
+TSU hardware pmode samples natively.
 
 ### Mapping table
 
-| PC-Transformers concept | QuantiMORK-THRML | thrml API |
-|-------------------------|------------------|-----------|
-| MLP dense weights | WaveletLinear per-level weights | `SquareCategoricalEBMFactor` |
-| PC latent state x | Wavelet coefficients (level, pos) | `CategoricalNode` K bins |
-| prediction error | Factor graph energy | Factor potential |
-| T-step iteration | — | Gibbs warmup + sampling |
-| Leaf observations | Clamped input activations | `BlockGibbsSpec(clamped)` |
+| PC-Transformers concept | QuantiMORK-THRML | thrml API (categorical) | thrml API (p-mode) |
+|-------------------------|------------------|------------------------|-------------------|
+| MLP dense weights | WaveletLinear per-level weights | `SquareCategoricalEBMFactor` | `CouplingFactor` / `LinearFactor` |
+| PC latent state x | Wavelet coefficients (level, pos) | `CategoricalNode` K bins | `ContinuousNode` (Gaussian) |
+| prediction error | Factor graph energy | K×K lookup table | Quadratic `QuadraticFactor` |
+| T-step iteration | — | Gibbs warmup + sampling | Gibbs warmup + sampling |
+| Leaf observations | Clamped input activations | `BlockGibbsSpec(clamped)` | Absorbed into bias terms |
 
 ## Results
 
@@ -272,7 +288,8 @@ Tiny Shakespeare, 5 epochs, n_embed=128, n_blocks=4, T=2, CPU training:
 |--------|:---------------:|:-----------------------------------:|
 | Parameters | 1.06M | 0.56M |
 | MLP params/layer | dense | 90K (wavelet) |
-| Max connections/node | 512 | ≤5 |
+| Inter-level connections/node | 512 | ≤5 |
+| Intra-level connections/node | 512 | 256/128/64 (dense per level) |
 | Final train PPL | 954.9 | 963.7 |
 | Final val PPL | 952.8 | 956.7 |
 | Final train energy | 1.3762 | 1.6966 |
@@ -335,13 +352,33 @@ These functions use JAX + thrml (not PyTorch) for factor graph verification.
 
 | Function | Description |
 |----------|-------------|
-| `build_single_level_graph(weight_matrix, input_act, target_act, ...)` | Build thrml factor graph for one WaveletLinear level with optional TD modulation and KL regularization |
+| `build_single_level_graph(..., backend="categorical")` | Build thrml factor graph for one WaveletLinear level; `backend="pmode"` uses continuous Gaussian nodes |
 | `run_verification(graph, seed=0, n_batches=30)` | Run Gibbs sampling on factor graph; returns `{sampled_values, target_values, mse, sampled_energy}` |
-| `pc_prediction_weights(precision, k=16)` | K×K pairwise weight matrix encoding PC squared prediction error |
-| `td_modulation_weights(alpha, precision, k=16)` | K×K pairwise weight matrix encoding top-down modulation energy |
-| `kl_prior_weights(prior_probs, beta=0.1, k=16)` | [K] unary weight vector encoding KL divergence complexity penalty |
-| `coeff_bin_centers(k=16)` | K evenly-spaced bin centers for discretizing activations |
-| `value_to_bin(value, k=16)` / `bin_to_value(bin_idx, k=16)` | Quantize continuous scalar ↔ bin index |
+| `pc_prediction_weights(precision, k=16)` | K×K pairwise weight matrix encoding PC squared prediction error (categorical only) |
+| `td_modulation_weights(alpha, precision, k=16)` | K×K pairwise weight matrix encoding top-down modulation energy (categorical only) |
+| `kl_prior_weights(prior_probs, beta=0.1, k=16)` | [K] unary weight vector encoding KL divergence complexity penalty (categorical only) |
+| `coeff_bin_centers(k=16)` | K evenly-spaced bin centers for discretizing activations (categorical only) |
+| `value_to_bin(value, k=16)` / `bin_to_value(bin_idx, k=16)` | Quantize continuous scalar ↔ bin index (categorical only) |
+
+### Gaussian EBM (`quantimork_thrml.gaussian_ebm`)
+
+Custom thrml components for p-mode (continuous Gaussian) factor graphs,
+based on Extropic's [official Gaussian PGM example](https://docs.thrml.ai/en/latest/examples/01_all_of_thrml/).
+
+| Class | Description |
+|-------|-------------|
+| `ContinuousNode(AbstractNode)` | Continuous random variable node (pmode on TSU) |
+| `QuadraticFactor(inverse_weights, block)` | Diagonal precision: `E_i = 0.5 * A_ii * x_i²` |
+| `LinearFactor(weights, block)` | Bias term: `E_i = b_i * x_i` |
+| `CouplingFactor(weights, (block_a, block_b))` | Pairwise scalar coupling: `E = w * x_i * x_j` |
+| `GaussianSampler()` | Gibbs conditional sampler for Gaussian nodes |
+
+### P-mode verification (`quantimork_thrml.pmode_verify`)
+
+| Function | Description |
+|----------|-------------|
+| `build_pmode_level_graph(W, input, target, ...)` | Build continuous Gaussian factor graph for one WaveletLinear level |
+| `run_pmode_verification(graph, seed=0)` | Run Gibbs sampling; returns `{sampled_values, mse, analytic_mean, ...}` |
 
 ## Hyperon integration outlook
 
@@ -356,9 +393,54 @@ spatial partitioning is an open question (depends on factor graph size, lattice
 partitioning, and mixing time).
 
 The key architectural difference from standard PC: QuantiMORK's wavelet
-decomposition limits each coefficient node to ≤5 neighbors, fitting within
-TSU's ~12-neighbor hardware constraint. Dense PC layers (512+ connections)
-would require multi-chip partitioning for even a single layer.
+decomposition limits inter-level connectivity to ≤5 neighbors per node.
+However, per-level Linear layers are still dense (up to 256 intra-level
+connections at level 1), exceeding TSU's ~12-neighbor hardware limit.
+See [Connectivity & Sparsity](#connectivity--sparsity) for analysis and
+candidate sparsification directions.
+
+## Connectivity & Sparsity
+
+The wavelet decomposition creates a tree topology where each coefficient
+has ≤5 inter-level neighbors. However, per-level `nn.Linear(size, size)`
+layers create **dense intra-level** coupling:
+
+```
+$ python scripts/connectivity_analysis.py
+
+Level                  Size │  Direct (W) max │  TSU limit (12)
+Detail Level 1          256 │             256 │  ⚠ 21× over
+Detail Level 2          128 │             128 │  ⚠ 11× over
+Detail Level 3           64 │              64 │  ⚠  5× over
+Approx Level 3           64 │              64 │  ⚠  5× over
+```
+
+The induced precision matrix `WᵀW` is similarly dense at each level.
+
+### Candidate sparsification directions (open question)
+
+These are directions to explore, not solutions. Each involves trade-offs
+that require experimental validation:
+
+- **Banded weights**: Restrict `W[i,j] = 0` for `|i-j| > bandwidth`.
+  Physical intuition: adjacent wavelet coefficients couple more strongly
+  than distant ones. Reduces connectivity to `O(bandwidth)`, but may
+  sacrifice expressiveness — especially for non-local correlations.
+
+- **Second-level wavelet** (wavelet-on-wavelet): Apply another Haar
+  decomposition *within* each per-level Linear, recursively reducing
+  connectivity. Increases implementation complexity.
+
+- **Structured pruning**: Train dense, then prune to a fixed connectivity
+  budget (magnitude pruning, `|W[i,j]| < threshold → 0`). Threshold sweep
+  shows 100% TSU compliance at `ε ≥ 0.10` (random init), but trained
+  weights may have different sparsity patterns.
+
+- **TSU tiling**: Partition a large level across multiple TSU tiles.
+  Inter-tile communication latency needs analysis.
+
+Run `python scripts/connectivity_analysis.py` to measure current
+connectivity on your trained model.
 
 ## Project structure
 
@@ -367,11 +449,14 @@ quantimork_thrml/
 ├── haar.py               # Haar DWT / IDWT (§7.4.2)
 ├── wavelet_linear.py     # WaveletLinear: Haar → per-level Linear → IDWT
 ├── model.py              # WaveletPCTransformer (replaces MLP in PC-Transformers)
-└── thrml_verify.py       # Extract weights → thrml factor graph → verify
+├── thrml_verify.py       # Factor graph verification (categorical + pmode dispatch)
+├── gaussian_ebm.py       # ContinuousNode, QuadraticFactor, CouplingFactor, GaussianSampler
+└── pmode_verify.py       # P-mode (continuous Gaussian) factor graph verification
 scripts/
 ├── prepare_data.py       # Download + tokenize Tiny Shakespeare
 ├── train.py              # Train wavelet or baseline model
-└── compare.py            # Print comparison table
+├── compare.py            # Print comparison table
+└── connectivity_analysis.py  # Per-level connectivity measurement
 tests/
 ├── conftest.py           # Shared fixtures and tolerances
 ├── test_haar.py          # Haar roundtrip + coefficient correctness

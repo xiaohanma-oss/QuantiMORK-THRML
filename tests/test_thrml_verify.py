@@ -13,11 +13,27 @@ try:
     # Import directly from the module file to avoid __init__.py's torch dependency
     import importlib.util
     import os
-    _spec = importlib.util.spec_from_file_location(
-        "thrml_verify",
-        os.path.join(os.path.dirname(__file__), "..", "quantimork_thrml", "thrml_verify.py"))
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
+    import sys
+    import types
+
+    # Set up fake package so quantimork_thrml.gaussian_ebm can be imported
+    _fake_pkg = types.ModuleType("quantimork_thrml")
+    _fake_pkg.__path__ = [os.path.join(os.path.dirname(__file__), "..", "quantimork_thrml")]
+    sys.modules["quantimork_thrml"] = _fake_pkg
+
+    def _load_module(name, filename):
+        spec = importlib.util.spec_from_file_location(
+            f"quantimork_thrml.{name}",
+            os.path.join(os.path.dirname(__file__), "..", "quantimork_thrml", filename))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"quantimork_thrml.{name}"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    _load_module("gaussian_ebm", "gaussian_ebm.py")
+    _load_module("pmode_verify", "pmode_verify.py")
+    _mod = _load_module("thrml_verify", "thrml_verify.py")
+
     build_single_level_graph = _mod.build_single_level_graph
     run_verification = _mod.run_verification
     pc_prediction_weights = _mod.pc_prediction_weights
@@ -153,3 +169,85 @@ class TestKLDivergence:
         result = run_verification(graph, seed=42)
 
         assert result["mse"] < 0.15, f"MSE {result['mse']:.4f} > 0.15"
+
+
+class TestPmodeBackend:
+    """P-mode (continuous Gaussian) backend tests.
+
+    These verify that the pmode backend encodes PC energy exactly
+    (no K-bin discretization error), achieving tighter tolerances.
+    """
+
+    def test_pmode_basic_recovery(self):
+        """P-mode Gibbs sampling recovers W @ x exactly."""
+        np.random.seed(42)
+        W = np.random.randn(8, 8).astype(np.float32) * 0.1
+        x_in = np.random.randn(8).astype(np.float32) * 0.5
+        target = (W @ x_in).astype(np.float32)
+
+        graph = build_single_level_graph(
+            W, x_in, target, precision=2.0, backend="pmode")
+        result = run_verification(graph, seed=42)
+
+        assert result["mse"] < 0.01, f"P-mode MSE {result['mse']:.6f} > 0.01"
+
+    def test_pmode_identity_weight(self):
+        """Identity weight with p-mode → output matches input."""
+        W = np.eye(8, dtype=np.float32) * 0.5
+        x_in = np.array([0.1, 0.2, -0.1, 0.3, -0.2, 0.0, 0.15, -0.05],
+                        dtype=np.float32)
+        target = (W @ x_in).astype(np.float32)
+
+        graph = build_single_level_graph(
+            W, x_in, target, precision=3.0, backend="pmode")
+        result = run_verification(graph, seed=123)
+
+        assert result["mse"] < 0.01
+
+    def test_pmode_with_td(self):
+        """P-mode with top-down modulation still converges."""
+        np.random.seed(42)
+        W = np.random.randn(8, 8).astype(np.float32) * 0.1
+        x_in = np.random.randn(8).astype(np.float32) * 0.5
+        target = (W @ x_in).astype(np.float32)
+        td = target + np.random.randn(8).astype(np.float32) * 0.05
+
+        graph = build_single_level_graph(
+            W, x_in, target, precision=2.0,
+            td_activations=td, td_alpha=0.5, backend="pmode")
+        result = run_verification(graph, seed=42)
+
+        # With TD close to target, MSE should remain low
+        assert result["mse"] < 0.05, f"P-mode TD MSE {result['mse']:.6f} > 0.05"
+
+    def test_pmode_with_prior(self):
+        """P-mode with Gaussian prior still converges."""
+        np.random.seed(42)
+        W = np.random.randn(8, 8).astype(np.float32) * 0.1
+        x_in = np.random.randn(8).astype(np.float32) * 0.5
+        target = (W @ x_in).astype(np.float32)
+
+        graph = build_single_level_graph(
+            W, x_in, target, precision=2.0, beta=0.1, backend="pmode")
+        result = run_verification(graph, seed=42)
+
+        assert result["mse"] < 0.01, f"P-mode prior MSE {result['mse']:.6f} > 0.01"
+
+    def test_pmode_tighter_than_categorical(self):
+        """P-mode should achieve lower MSE than K=16 categorical."""
+        np.random.seed(42)
+        W = np.random.randn(8, 8).astype(np.float32) * 0.1
+        x_in = np.random.randn(8).astype(np.float32) * 0.5
+        target = (W @ x_in).astype(np.float32)
+
+        graph_cat = build_single_level_graph(
+            W, x_in, target, precision=2.0, k=16, backend="categorical")
+        result_cat = run_verification(graph_cat, seed=42)
+
+        graph_pm = build_single_level_graph(
+            W, x_in, target, precision=2.0, backend="pmode")
+        result_pm = run_verification(graph_pm, seed=42)
+
+        assert result_pm["mse"] <= result_cat["mse"], (
+            f"P-mode MSE {result_pm['mse']:.6f} > categorical MSE {result_cat['mse']:.6f}"
+        )
