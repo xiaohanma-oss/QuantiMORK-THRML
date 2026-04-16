@@ -93,13 +93,13 @@ class WaveletLinear(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def max_connections_per_node(self):
-        """Maximum number of connections per coefficient node.
+        """Largest per-level Linear dimension (= intra-level connections).
 
-        In the wavelet tree, each coefficient connects to:
-        - Its transform weights within the same level (local)
-        - Parent/children via Haar reconstruction (implicit, not learned)
-
-        The largest per-level Linear determines max connectivity.
+        Returns the size of the biggest per-level Linear, which equals
+        the number of intra-level connections per node at that level.
+        This is the TSU-relevant bottleneck — all levels exceed the
+        ~12 neighbor hardware limit. Inter-level connections (via Haar
+        tree) are ≤5 and not counted here.
         """
         max_size = 0
         for t in self.detail_transforms:

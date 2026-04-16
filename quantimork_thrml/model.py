@@ -41,7 +41,7 @@ class WaveletMLP(nn.Module):
 
     Wavelet MLP: WaveletLinear(512→512, 3 levels)
                  = Haar DWT → per-level small Linear → IDWT
-                 = ~90K params, max 5 connections/node
+                 = ~90K params, ≤5 inter-level + dense intra-level
     """
 
     def __init__(self, config):

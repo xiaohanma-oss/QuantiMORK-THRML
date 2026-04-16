@@ -11,9 +11,6 @@ The key verification:
     PyTorch PC energy ≈ thrml Gibbs sampling energy
 """
 
-import json
-import math
-
 import jax
 import jax.numpy as jnp
 

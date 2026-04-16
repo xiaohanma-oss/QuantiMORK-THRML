@@ -65,7 +65,8 @@ def main():
     if have_wavelet:
         w = load_results(wavelet_path)
         print("TSU deployability:")
-        print(f"  Max connections/node (wavelet MLP): ≤5  (TSU limit: ~12)  ✓")
+        print(f"  Inter-level connections/node: ≤5  (wavelet tree)")
+        print(f"  Intra-level connections/node: 256/128/64  (dense per level, exceeds TSU ~12 limit)")
         if have_baseline:
             b = load_results(baseline_path)
             ratio = b["config"]["n_params"] / w["config"]["n_params"]
