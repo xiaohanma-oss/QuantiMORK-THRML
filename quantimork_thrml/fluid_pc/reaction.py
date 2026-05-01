@@ -38,9 +38,17 @@ class PCReaction(nn.Module):
             rho: (B, |V|) density-like tensor.
         Returns:
             (B, |V|) updated density.
+
+        Side effect: stores the *last* prediction-error squared sum on
+        `self.last_reaction_energy` as a scalar autograd-tracked tensor.
+        FluidPCBlock accumulates this across outer iters into the §10.7
+        free-energy training term.
         """
+        last_err_sq = None
         for _ in range(self.reaction_steps):
             predicted = self.predictor(rho)
             err = rho - predicted
+            last_err_sq = (err ** 2).sum(dim=-1).mean()
             rho = rho - self.eta * err
+        self.last_reaction_energy = last_err_sq
         return rho

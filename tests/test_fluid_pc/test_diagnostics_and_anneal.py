@@ -46,6 +46,18 @@ def test_diagnostics_record_four_scalars_per_iteration():
         assert d["achieved_cfl"] <= 0.45 + 1e-3
 
 
+def test_three_part_free_energy_is_populated():
+    b = _new_block()
+    x = torch.randn(2, 8, 16)
+    _ = b(x)
+    fe = b.last_free_energy
+    assert "reaction" in fe and "v_anchor" in fe
+    assert torch.isfinite(fe["reaction"]).all().item()
+    assert torch.isfinite(fe["v_anchor"]).all().item()
+    assert fe["reaction"].requires_grad
+    assert fe["v_anchor"].requires_grad
+
+
 def test_value_head_receives_gradient():
     b = _new_block()
     x = torch.randn(2, 8, 16)

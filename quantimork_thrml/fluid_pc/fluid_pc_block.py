@@ -108,6 +108,7 @@ class FluidPCBlock(nn.Module):
         self.value_head = nn.Linear(cfg.D, 1, bias=False)
 
         self.last_diagnostics: list = []
+        self.last_free_energy: dict = {}
 
     @staticmethod
     def _normalize_rho(rho: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -144,8 +145,12 @@ class FluidPCBlock(nn.Module):
         v_field = self._value_field(x)
 
         diagnostics = []
+        reaction_energies = []
+        v_field_anchor_loss = None
         for k in range(cfg.fluid_outer_iters):
             rho = self.reaction(rho)
+            if self.reaction.last_reaction_energy is not None:
+                reaction_energies.append(self.reaction.last_reaction_energy)
             u = self.mpc(rho, v_field)
             u = self.leray(u)
             dt = self.advection.rescale_dt(u, target_cfl=cfg.cfl_target)
@@ -171,8 +176,21 @@ class FluidPCBlock(nn.Module):
             })
 
         self.last_diagnostics = diagnostics
+        # §10.7 free-energy training term — sum of reaction prediction
+        # errors across outer iters, plus a value-anchor term that ties the
+        # learned W_θ to the converged density (gives value_head gradient
+        # via a meaningful supervision signal, not just the readout-mix
+        # workaround).
+        react_total = (sum(reaction_energies)
+                       if reaction_energies
+                       else torch.zeros((), device=rho.device))
+        v_anchor = ((v_field - rho.detach()) ** 2).sum(dim=-1).mean()
+        self.last_free_energy = {
+            "reaction": react_total,
+            "v_anchor": v_anchor,
+        }
         # Mix v_field into the final readout so value_head receives gradient
-        # signal even when MPC runs in the default detached mode.
+        # via the main forward path as well.
         rho_final = rho + 0.1 * v_field
         rho_final = rho_final / rho_final.sum(dim=-1, keepdim=True)
         return self.readout(rho_final)

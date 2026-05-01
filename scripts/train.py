@@ -125,14 +125,29 @@ def train_epoch_fluid(model, dataloader, config, global_step, device,
             target_ids.reshape(-1),
             ignore_index=0,
         )
-        ce_loss.backward()
+        # §10.7 three-part free energy: task loss + reaction PE + value
+        # anchor (regional v_field <-> converged rho consistency).
+        react_total = 0.0
+        anchor_total = 0.0
+        for blk in model.blocks:
+            fe = getattr(blk.fluid_pc, "last_free_energy", {})
+            if fe:
+                react_total = react_total + fe["reaction"]
+                anchor_total = anchor_total + fe["v_anchor"]
+        w_react = getattr(config, "fluid_react_weight", 0.01)
+        w_anchor = getattr(config, "fluid_anchor_weight", 0.1)
+        loss = ce_loss + w_react * react_total + w_anchor * anchor_total
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_ce_loss += ce_loss.item()
         batch_count += 1
         global_step += 1
         ppl = math.exp(ce_loss.item()) if ce_loss.item() < 100 else float("inf")
-        print(f"  step {global_step} | CE={ce_loss.item():.4f} PPL={ppl:.1f}")
+        rval = react_total.item() if hasattr(react_total, "item") else 0.0
+        aval = anchor_total.item() if hasattr(anchor_total, "item") else 0.0
+        print(f"  step {global_step} | CE={ce_loss.item():.4f} "
+              f"PPL={ppl:.1f} react={rval:.4f} anchor={aval:.4f}")
     avg_ce = total_ce_loss / max(batch_count, 1)
     avg_ppl = math.exp(avg_ce) if avg_ce < 100 else float("inf")
     return avg_ce, avg_ppl, global_step
