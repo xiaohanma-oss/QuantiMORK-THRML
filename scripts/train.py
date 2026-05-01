@@ -44,14 +44,15 @@ def evaluate(model, config, dataloader, max_batches=None, device=None):
     for batch_idx, batch in enumerate(dataloader):
         if max_batches and batch_idx >= max_batches:
             break
-        input_ids = batch["input_ids"].to(device)
-        targets = batch["target_ids"].to(device)
+        input_ids = batch["input_ids"].to(device)[:, :config.block_size]
+        targets = batch["target_ids"].to(device)[:, :config.block_size]
         if targets.max() >= vocab_size:
             targets = torch.clamp(targets, max=vocab_size - 1)
 
         logits = model(targets, input_ids)
         ce = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0)
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1), ignore_index=0)
         total_ce += ce.item()
 
         energies = []
