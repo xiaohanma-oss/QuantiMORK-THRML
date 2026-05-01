@@ -1,6 +1,7 @@
 """FluidPCBlock — IFN §10.6 drop-in attention replacement for QuantiMORK-THRML."""
 
 from quantimork_thrml.fluid_pc.advection import ConservativeAdvection
+from quantimork_thrml.fluid_pc.cross_scale_predictor import CrossScalePredictor
 from quantimork_thrml.fluid_pc.cycle_basis import build_cycle_basis
 from quantimork_thrml.fluid_pc.drift_mpc import MPCDrift
 from quantimork_thrml.fluid_pc.fluid_pc_block import (
@@ -18,6 +19,7 @@ from quantimork_thrml.fluid_pc.topology import (
 
 __all__ = [
     "ConservativeAdvection",
+    "CrossScalePredictor",
     "FluidGraphTopology",
     "FluidPCBlock",
     "FluidPCConfig",

@@ -43,8 +43,12 @@ class ConservativeAdvection(nn.Module):
         return (target_cfl / u_max).clamp_max(dt_max)
 
     def forward(self, rho: torch.Tensor, u: torch.Tensor,
-                dt: torch.Tensor) -> torch.Tensor:
+                dt: torch.Tensor,
+                kappa_override: float = None) -> torch.Tensor:
         """rho: (B, |V|), u: (B, |E|), dt: scalar or (B,) tensor.
+
+        IFN §10.7: κ may be annealed across inner steps. Pass `kappa_override`
+        to use a per-iteration value instead of the persistent buffer.
 
         Returns rho_new with the same shape as rho.
         """
@@ -62,5 +66,6 @@ class ConservativeAdvection(nn.Module):
         else:
             dt_b = dt.view(*dt.shape, 1)
 
+        kappa = self.kappa if kappa_override is None else kappa_override
         diffusion = graph.laplacian_apply(rho)
-        return rho - dt_b * div_phi - dt_b * self.kappa * diffusion
+        return rho - dt_b * div_phi - dt_b * kappa * diffusion

@@ -1,22 +1,23 @@
 """
-PC reaction step on the wavelet density.
+PC reaction step on the wavelet density (IFN §10.4).
 
-Predictor: a `WaveletLinear` operating on the (B, S, D) coefficient stack
-(after `rho_to_coeffs`). The prediction error e = a - W(a) drives an
-energy-descent update on a:
-    a <- a - eta * e
-which is the Euler step on F = 0.5 * ||a - W(a)||^2.
+Predictor: `CrossScalePredictor` operating directly on graph nodes. Each
+node predicts its activation from intra-scale lateral neighbors plus
+cross-scale parents and children, per the paper's mandate (line 1696):
+*"Each node predicts its activation from local neighborhood and cross-
+scale parents/children"*. The previous `WaveletLinear`-based predictor
+was per-level dense and missed the parent/child terms — and also violated
+the TSU 12-neighbor connectivity limit. The new predictor uses only the
+graph's intrinsic edges, so per-node connectivity ≈ 5.
 
-The predictor instance here is *separate* from any predictor in `WaveletMLP`
-— same class, different parameters.
+Energy-descent step: a ← a − η · (a − â).
 """
 
 import torch
 import torch.nn as nn
 
+from quantimork_thrml.fluid_pc.cross_scale_predictor import CrossScalePredictor
 from quantimork_thrml.fluid_pc.graph import WaveletGraph
-from quantimork_thrml.haar import haar_idwt_1d
-from quantimork_thrml.wavelet_linear import WaveletLinear
 
 
 class PCReaction(nn.Module):
@@ -28,23 +29,18 @@ class PCReaction(nn.Module):
         self.D = D
         self.reaction_steps = reaction_steps
         self.eta = eta
-        self.predictor = WaveletLinear(D, D, n_levels=n_levels)
+        self.predictor = CrossScalePredictor(graph)
 
     def forward(self, rho: torch.Tensor) -> torch.Tensor:
         """One or more PC error-reduction steps on the wavelet density.
 
         Args:
-            rho: (B, |V|) density-like tensor (need not be a strict simplex).
+            rho: (B, |V|) density-like tensor.
         Returns:
             (B, |V|) updated density.
         """
         for _ in range(self.reaction_steps):
-            coeffs = self.graph.rho_to_coeffs(rho)
-            coeffs_signal = haar_idwt_1d(coeffs)
-            predicted_signal = self.predictor(coeffs_signal)
-            from quantimork_thrml.haar import haar_dwt_1d
-            predicted_coeffs = haar_dwt_1d(predicted_signal, self.n_levels)
-            predicted_rho = self.graph.coeffs_to_rho(predicted_coeffs)
-            err = rho - predicted_rho
+            predicted = self.predictor(rho)
+            err = rho - predicted
             rho = rho - self.eta * err
         return rho
