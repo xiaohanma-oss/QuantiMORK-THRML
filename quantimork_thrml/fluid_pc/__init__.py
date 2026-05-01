@@ -2,7 +2,10 @@
 
 from quantimork_thrml.fluid_pc.advection import ConservativeAdvection
 from quantimork_thrml.fluid_pc.cross_scale_predictor import CrossScalePredictor
-from quantimork_thrml.fluid_pc.cycle_basis import build_cycle_basis
+from quantimork_thrml.fluid_pc.cycle_basis import (
+    build_cycle_basis,
+    build_face_local_basis,
+)
 from quantimork_thrml.fluid_pc.drift_mpc import MPCDrift
 from quantimork_thrml.fluid_pc.fluid_pc_block import (
     FluidPCBlock,
@@ -29,5 +32,6 @@ __all__ = [
     "WaveletGraph",
     "WaveletReadout",
     "build_cycle_basis",
+    "build_face_local_basis",
     "build_topology",
 ]

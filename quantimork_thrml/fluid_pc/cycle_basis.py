@@ -131,4 +131,100 @@ def build_cycle_basis(
     return U, n_cyc
 
 
-__all__ = ["build_cycle_basis"]
+def build_face_local_basis(
+    topology: FluidGraphTopology,
+) -> Tuple[torch.Tensor, int]:
+    """Face-local cycle basis (IFN §10.10): "Build cycle-space modes per
+    face (spatial) and per cross-scale face (parent-child-square)."
+
+    The wavelet graph has no purely spatial faces (lateral edges form paths
+    along S, not loops, since within each (band, b) column it's a chain).
+    The natural faces here are **parent-child-squares** spanning the
+    cross-scale + lateral edges. For adjacent s, s+1 and a finer-level
+    node b with parent b//2 (or sibling-paired approx) one face is:
+
+        (s, child)  --lat-->  (s+1, child)
+            |                       |
+        cross-up                  cross-up
+            |                       |
+        (s, parent) <--lat--  (s+1, parent)
+
+    Each face yields one cycle column with four ±1 entries.
+
+    Returns sparse U: (|E|, n_faces) and n_faces. Linear independence is
+    NOT guaranteed (faces may be redundant), but every column lies in the
+    kernel of B^T, so u = U @ alpha is divergence-free regardless.
+    """
+    n_e = topology.n_edges
+    src = topology.edge_src
+    dst = topology.edge_dst
+    n_lat = topology.n_lateral
+
+    # Edge lookup: (src, dst) -> edge_idx, for both lateral and cross.
+    edge_lookup = {}
+    for e in range(n_e):
+        edge_lookup[(src[e], dst[e])] = e
+
+    n_levels = topology.n_levels
+    band_offsets = topology.band_offsets
+    band_sizes = topology.band_sizes
+    D = topology.D
+    S = topology.S
+    # Cross-scale face = (s, child)<->(s+1, child)<->(s+1, parent)<->(s, parent)
+    # for each (level ell in [0..n_levels-1], child b in band_sizes[ell]) with
+    # parent at child_band ell+1 (or approx for ell == n_levels-1).
+    rows, cols, vals = [], [], []
+    face_idx = 0
+
+    def _node(s, band, b):
+        return s * D + band_offsets[band] + b
+
+    def _try_add_face(s, child_band, b_child, parent_band, b_parent):
+        nonlocal face_idx
+        c0 = _node(s, child_band, b_child)
+        c1 = _node(s + 1, child_band, b_child)
+        p1 = _node(s + 1, parent_band, b_parent)
+        p0 = _node(s, parent_band, b_parent)
+        # Look up the 4 directed edges (any orientation).
+        def _lookup_signed(u, v):
+            if (u, v) in edge_lookup:
+                return edge_lookup[(u, v)], +1
+            if (v, u) in edge_lookup:
+                return edge_lookup[(v, u)], -1
+            return None, 0
+        e1, s1 = _lookup_signed(c0, c1)
+        e2, s2 = _lookup_signed(c1, p1)
+        e3, s3 = _lookup_signed(p1, p0)
+        e4, s4 = _lookup_signed(p0, c0)
+        if None in (e1, e2, e3, e4):
+            return
+        for e, sgn in ((e1, s1), (e2, s2), (e3, s3), (e4, s4)):
+            rows.append(e); cols.append(face_idx); vals.append(float(sgn))
+        face_idx += 1
+
+    for ell in range(n_levels - 1):
+        child_band, parent_band = ell, ell + 1
+        for b_child in range(band_sizes[child_band]):
+            b_parent = b_child // 2
+            for s in range(S - 1):
+                _try_add_face(s, child_band, b_child, parent_band, b_parent)
+
+    last_detail = n_levels - 1
+    approx_band = n_levels
+    for b in range(band_sizes[last_detail]):
+        for s in range(S - 1):
+            _try_add_face(s, last_detail, b, approx_band, b)
+
+    n_faces = face_idx
+    if n_faces == 0:
+        indices = torch.zeros((2, 0), dtype=torch.long)
+        values = torch.zeros((0,), dtype=torch.float32)
+    else:
+        indices = torch.tensor([rows, cols], dtype=torch.long)
+        values = torch.tensor(vals, dtype=torch.float32)
+    U = torch.sparse_coo_tensor(indices, values,
+                                size=(n_e, max(n_faces, 1))).coalesce()
+    return U, n_faces
+
+
+__all__ = ["build_cycle_basis", "build_face_local_basis"]

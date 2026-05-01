@@ -42,6 +42,25 @@ def test_apply_U_is_autograd_safe():
     assert torch.isfinite(alpha.grad).all().item()
 
 
+def test_face_local_basis_kernel_property():
+    """§10.10 face-local cycles must lie in ker(B^T) just like BFS-tree ones."""
+    g = WaveletGraph(S=4, D=8, n_levels=2, cycle_basis="face_local")
+    alpha = torch.randn(2, g.n_cycles)
+    u = g.apply_U(alpha)
+    div = g.divergence(u)
+    assert div.abs().max().item() < 1e-5
+
+
+def test_face_local_columns_have_four_entries():
+    """Each parent-child-square face contributes a 4-edge cycle."""
+    from quantimork_thrml.fluid_pc.cycle_basis import build_face_local_basis
+    topo = build_topology(S=4, D=8, n_levels=2)
+    U, n = build_face_local_basis(topo)
+    Ud = U.to_dense()
+    nnz_per_col = (Ud != 0).sum(dim=0)
+    assert (nnz_per_col[:n] == 4).all().item()
+
+
 def test_basis_columns_are_signed_pm1():
     topo = build_topology(S=4, D=8, n_levels=2)
     U, _ = build_cycle_basis(topo)

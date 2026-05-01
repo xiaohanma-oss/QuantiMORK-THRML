@@ -17,20 +17,26 @@ preserve autograd and are exact roundtrip (matches haar_dwt_1d ordering).
 import torch
 import torch.nn as nn
 
-from quantimork_thrml.fluid_pc.cycle_basis import build_cycle_basis
+from quantimork_thrml.fluid_pc.cycle_basis import (
+    build_cycle_basis,
+    build_face_local_basis,
+)
 from quantimork_thrml.fluid_pc.topology import FluidGraphTopology, build_topology
 
 
 class WaveletGraph(nn.Module):
     """Static wavelet graph topology cached as buffers."""
 
-    def __init__(self, S: int, D: int, n_levels: int):
+    def __init__(self, S: int, D: int, n_levels: int,
+                 cycle_basis: str = "bfs_tree"):
+        """cycle_basis: 'bfs_tree' (default) or 'face_local' per IFN §10.10."""
         super().__init__()
         topo = build_topology(S, D, n_levels)
         self.S = S
         self.D = D
         self.n_levels = n_levels
         self.topology = topo
+        self._cycle_basis_kind = cycle_basis
 
         edge_src = torch.tensor(topo.edge_src, dtype=torch.long)
         edge_dst = torch.tensor(topo.edge_dst, dtype=torch.long)
@@ -65,7 +71,10 @@ class WaveletGraph(nn.Module):
 
         # Cycle-space basis (IFN §10.10): u = U @ alpha is divergence-free
         # by construction, so MPCDrift can stay solenoidal-first per §11.1.
-        U_sparse, n_cycles = build_cycle_basis(topo)
+        if cycle_basis == "face_local":
+            U_sparse, n_cycles = build_face_local_basis(topo)
+        else:
+            U_sparse, n_cycles = build_cycle_basis(topo)
         self.n_cycles = n_cycles
         coal = U_sparse.coalesce()
         self.register_buffer("U_indices", coal.indices().clone())
