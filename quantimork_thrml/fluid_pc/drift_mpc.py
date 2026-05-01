@@ -1,24 +1,22 @@
 """
-Receding-horizon MPC drift solver.
+Receding-horizon MPC drift solver — solenoidal-first (IFN §10.5 / §11.1).
 
-We optimize per-edge raw velocity u_raw ∈ ℝ^|E| (no cycle-space basis in
-Phase 1 — the divergence-free constraint is enforced downstream by Leray
-projection) over a horizon of H rollout steps. The control cost penalizes
-||u||^2 and the terminal cost shapes rho_H toward a learned `value_field`
-proxy via squared distance.
+Per IFN §11.1 ("Solenoidal parameterization first, projection second"), we
+optimize coefficients α ∈ ℝ^{B, K_cyc} in the cycle-space basis {U_k}
+rather than raw per-edge velocity. The velocity u = U @ α is divergence-
+free **by construction**, so no Leray projection is needed during the
+inner cost rollout. A single Leray pass downstream in `FluidPCBlock` is
+kept as the §10.10 safety net (numerical drift through fp32 advection).
 
-Cost (per batch element):
-    J(u_raw) = sum_{t=0..H-1} 0.5 * control_weight * ||u_t||^2
-             + 0.5 * terminal_weight * ||rho_H - value_field||^2
+Cost:
+    J(α) = sum_{t=0..H-1} 0.5 * control_weight * ||α||^2
+         + 0.5 * terminal_weight * ||rho_H - value_field||^2
+α is held constant across t (constant-control variant); H-step structure
+preserved by repeatedly applying the same u over the rollout.
 
-`u_t` is held constant across t in this Phase-1 implementation (constant
-control), so only one |E|-dim vector is optimized per batch. This is the
-simplest receding-horizon variant; richer per-step parameterization is
-straightforward to add later.
-
-By default `mpc_differentiable=False`: the optimizer runs inside a no_grad
-context and only the final `u_raw` is returned to the outer pass as a
-detached constant. Set True to backprop through inner Adam steps.
+By default `mpc_differentiable=False`: the inner Adam optimization runs
+under a torch.enable_grad scope on a fresh α with stop-grad on rho/value;
+final u is returned as a detached constant to the outer forward.
 """
 
 import torch
@@ -50,14 +48,14 @@ class MPCDrift(nn.Module):
         self.mpc_differentiable = mpc_differentiable
         self.cfl_target = cfl_target
 
-    def _rollout_cost(self, u_raw: torch.Tensor, rho0: torch.Tensor,
+    def _rollout_cost(self, alpha: torch.Tensor, rho0: torch.Tensor,
                       value_field: torch.Tensor) -> torch.Tensor:
-        u = self.leray(u_raw)
+        u = self.graph.apply_U(alpha)
         dt = self.advection.rescale_dt(u, target_cfl=self.cfl_target)
         rho = rho0
         for _ in range(self.horizon):
             rho = self.advection(rho, u, dt)
-        control = 0.5 * self.control_weight * (u_raw ** 2).sum(dim=-1)
+        control = 0.5 * self.control_weight * (alpha ** 2).sum(dim=-1)
         terminal = 0.5 * self.terminal_weight * \
             ((rho - value_field) ** 2).sum(dim=-1)
         return control + terminal
@@ -65,37 +63,43 @@ class MPCDrift(nn.Module):
     def _solve(self, rho0: torch.Tensor,
                value_field: torch.Tensor) -> torch.Tensor:
         B = rho0.shape[0]
-        u_raw = torch.zeros(B, self.graph.n_edges,
+        K_cyc = max(self.graph.n_cycles, 1)
+        alpha = torch.zeros(B, K_cyc,
                             device=rho0.device, dtype=rho0.dtype,
                             requires_grad=True)
-        opt = torch.optim.Adam([u_raw], lr=self.inner_lr)
+        opt = torch.optim.Adam([alpha], lr=self.inner_lr)
         for _ in range(self.inner_steps):
             opt.zero_grad()
-            cost = self._rollout_cost(u_raw, rho0, value_field).sum()
+            cost = self._rollout_cost(alpha, rho0, value_field).sum()
             cost.backward()
             opt.step()
-        return u_raw.detach()
+        return alpha.detach()
 
     def forward(self, rho: torch.Tensor,
                 value_field: torch.Tensor) -> torch.Tensor:
-        """Return the projected velocity `u = Leray(u_raw_optimal)`."""
+        """Return the divergence-free velocity `u = U @ alpha*`.
+
+        No Leray projection here — `u` is solenoidal by construction. The
+        `FluidPCBlock.forward` calls Leray once afterwards as a safety net.
+        """
         if self.mpc_differentiable:
-            u_raw = self._solve_differentiable(rho, value_field)
+            alpha = self._solve_differentiable(rho, value_field)
         else:
             with torch.enable_grad():
                 rho_d = rho.detach()
                 value_d = value_field.detach()
-                u_raw = self._solve(rho_d, value_d)
-        return self.leray(u_raw)
+                alpha = self._solve(rho_d, value_d)
+        return self.graph.apply_U(alpha)
 
     def _solve_differentiable(self, rho0: torch.Tensor,
                               value_field: torch.Tensor) -> torch.Tensor:
         B = rho0.shape[0]
-        u_raw = torch.zeros(B, self.graph.n_edges,
+        K_cyc = max(self.graph.n_cycles, 1)
+        alpha = torch.zeros(B, K_cyc,
                             device=rho0.device, dtype=rho0.dtype)
         for _ in range(self.inner_steps):
-            u_raw = u_raw.detach().requires_grad_(True)
-            cost = self._rollout_cost(u_raw, rho0, value_field).sum()
-            grad, = torch.autograd.grad(cost, u_raw, create_graph=True)
-            u_raw = u_raw - self.inner_lr * grad
-        return u_raw
+            alpha = alpha.detach().requires_grad_(True)
+            cost = self._rollout_cost(alpha, rho0, value_field).sum()
+            grad, = torch.autograd.grad(cost, alpha, create_graph=True)
+            alpha = alpha - self.inner_lr * grad
+        return alpha

@@ -17,6 +17,7 @@ preserve autograd and are exact roundtrip (matches haar_dwt_1d ordering).
 import torch
 import torch.nn as nn
 
+from quantimork_thrml.fluid_pc.cycle_basis import build_cycle_basis
 from quantimork_thrml.fluid_pc.topology import FluidGraphTopology, build_topology
 
 
@@ -61,6 +62,14 @@ class WaveletGraph(nn.Module):
         diag.scatter_add_(0, edge_src, torch.ones(n_edges))
         diag.scatter_add_(0, edge_dst, torch.ones(n_edges))
         self.register_buffer("laplacian_diag", diag)
+
+        # Cycle-space basis (IFN §10.10): u = U @ alpha is divergence-free
+        # by construction, so MPCDrift can stay solenoidal-first per §11.1.
+        U_sparse, n_cycles = build_cycle_basis(topo)
+        self.n_cycles = n_cycles
+        coal = U_sparse.coalesce()
+        self.register_buffer("U_indices", coal.indices().clone())
+        self.register_buffer("U_values", coal.values().clone())
 
     @property
     def n_nodes(self) -> int:
@@ -114,6 +123,25 @@ class WaveletGraph(nn.Module):
         Computed via grad(p) (per-edge differences) then divergence.
         """
         return self.divergence(self.gradient(p))
+
+    def apply_U(self, alpha: torch.Tensor) -> torch.Tensor:
+        """u = U @ alpha for batched alpha (B, K_cyc) -> (B, |E|).
+
+        Uses scatter_add_ for autograd-safe sparse-times-dense; matches the
+        existing divergence/gradient patterns in this class.
+        """
+        if self.n_cycles == 0:
+            return torch.zeros(*alpha.shape[:-1], self.n_edges,
+                               device=alpha.device, dtype=alpha.dtype)
+        edges = self.U_indices[0]
+        cycles = self.U_indices[1]
+        vals = self.U_values
+        contrib = vals.unsqueeze(0) * alpha.index_select(-1, cycles)
+        u = torch.zeros(*alpha.shape[:-1], self.n_edges,
+                        device=alpha.device, dtype=alpha.dtype)
+        u.scatter_add_(-1, edges.expand(*alpha.shape[:-1], edges.numel()),
+                       contrib)
+        return u
 
     def coeffs_to_rho(self, coeffs: dict) -> torch.Tensor:
         """Pack haar_dwt_1d output into (B, |V|) using the topology ordering.

@@ -409,10 +409,14 @@ Per-iteration pipeline (k = 1..K):
 
 1. **Reaction** — predict density via a small `WaveletLinear` and descend
    on local prediction error.
-2. **MPC drift** — receding-horizon optimization over per-edge velocity
-   `u ∈ ℝ^|E|` with control + terminal cost (target: initial density).
-3. **Leray projection** — Jacobi-CG on the graph Laplacian to enforce
-   `∇·u = 0` (with implicit-IFT backward).
+2. **MPC drift (solenoidal-first, IFN §10.5/§11.1)** — receding-horizon
+   optimization over cycle-space coefficients `α ∈ ℝ^K_cyc`. The velocity
+   `u = U @ α` is divergence-free **by construction** via the precomputed
+   cycle basis `{U_k}`, so the paper's "naive projection deletes useful
+   energy" failure mode is avoided.
+3. **Leray projection (safety net only)** — Jacobi-CG on the graph
+   Laplacian; runs as a numerical-drift safety net per §10.10, not the
+   primary divergence-free enforcement.
 4. **CFL rescale** — `dt = min(target_cfl / max|u|, dt_max)`.
 5. **Conservative advection** — upwind flux + κ-Laplacian diffusion;
    mass-conserving by construction.

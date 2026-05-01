@@ -1,6 +1,7 @@
 """FluidPCBlock — IFN §10.6 drop-in attention replacement for QuantiMORK-THRML."""
 
 from quantimork_thrml.fluid_pc.advection import ConservativeAdvection
+from quantimork_thrml.fluid_pc.cycle_basis import build_cycle_basis
 from quantimork_thrml.fluid_pc.drift_mpc import MPCDrift
 from quantimork_thrml.fluid_pc.fluid_pc_block import (
     FluidPCBlock,
@@ -25,5 +26,6 @@ __all__ = [
     "PCReaction",
     "WaveletGraph",
     "WaveletReadout",
+    "build_cycle_basis",
     "build_topology",
 ]

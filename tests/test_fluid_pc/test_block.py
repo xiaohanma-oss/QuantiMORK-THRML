@@ -45,6 +45,20 @@ def test_grad_flows_to_trainable_params():
     assert n_with_grad == n_total
 
 
+def test_solenoidal_first_means_leray_is_minor_correction():
+    """§11.1 conformance: u from MPC is solenoidal-by-construction, so the
+    safety-net Leray pass should change it by < 5% in norm."""
+    torch.manual_seed(0)
+    block = FluidPCBlock(_BlockConfig())
+    g = block.graph
+    rho = torch.rand(2, g.n_nodes)
+    rho = rho / rho.sum(-1, keepdim=True)
+    u_pre = block.mpc(rho, rho.detach())
+    u_post = block.leray(u_pre)
+    rel = (u_post - u_pre).norm(dim=-1) / u_pre.norm(dim=-1).clamp_min(1e-8)
+    assert rel.max().item() < 0.05
+
+
 def test_one_optimizer_step_changes_params():
     torch.manual_seed(0)
     block = FluidPCBlock(_BlockConfig())
