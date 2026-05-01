@@ -96,7 +96,46 @@ def make_config(mode="wavelet", num_epochs=5):
         config.wavelet_n_levels = 3
         config.td_alpha = 0.5
         config.beta = 0.1
+    config.attn_mode = "attn"
     return config
+
+
+def train_epoch_fluid(model, dataloader, config, global_step, device,
+                     optimizer, max_steps=None):
+    """Training step for attn_mode='fluid' — standard backprop with Adam.
+
+    The fluid block runs internal energy descent inside its forward, so we
+    don't need the vendor PC iterative scheme. Weights update via
+    `loss.backward()` + `optimizer.step()`.
+    """
+    model.train()
+    total_ce_loss = 0.0
+    batch_count = 0
+    for batch_idx, batch in enumerate(dataloader):
+        if max_steps is not None and global_step >= max_steps:
+            break
+        input_ids = batch["input_ids"].to(device)[:, :config.block_size]
+        target_ids = batch["target_ids"].to(device)[:, :config.block_size]
+        if target_ids.max() >= vocab_size:
+            target_ids = torch.clamp(target_ids, max=vocab_size - 1)
+        optimizer.zero_grad()
+        logits = model(target_ids, input_ids)
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            target_ids.reshape(-1),
+            ignore_index=0,
+        )
+        ce_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_ce_loss += ce_loss.item()
+        batch_count += 1
+        global_step += 1
+        ppl = math.exp(ce_loss.item()) if ce_loss.item() < 100 else float("inf")
+        print(f"  step {global_step} | CE={ce_loss.item():.4f} PPL={ppl:.1f}")
+    avg_ce = total_ce_loss / max(batch_count, 1)
+    avg_ppl = math.exp(avg_ce) if avg_ce < 100 else float("inf")
+    return avg_ce, avg_ppl, global_step
 
 
 def build_model(config, mode):
@@ -191,6 +230,14 @@ def main():
                         help="Top-down error weight for bidirectional Hebbian update")
     parser.add_argument("--beta", type=float, default=0.1,
                         help="KL divergence regularization strength")
+    parser.add_argument("--attn-mode", choices=["attn", "fluid"],
+                        default="attn",
+                        help="'fluid' replaces attention with FluidPCBlock (IFN §10.6)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Cap total training steps (smoke test)")
+    parser.add_argument("--fluid-outer-iters", type=int, default=2)
+    parser.add_argument("--mpc-horizon", type=int, default=2)
+    parser.add_argument("--mpc-inner-steps", type=int, default=3)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -200,7 +247,15 @@ def main():
     if args.mode == "wavelet":
         config.td_alpha = args.td_alpha
         config.beta = args.beta
+        config.attn_mode = args.attn_mode
+        if args.attn_mode == "fluid":
+            config.fluid_outer_iters = args.fluid_outer_iters
+            config.mpc_horizon = args.mpc_horizon
+            config.mpc_inner_steps = args.mpc_inner_steps
     model = build_model(config, args.mode).to(device)
+    fluid_mode = (args.mode == "wavelet" and args.attn_mode == "fluid")
+    optimizer = (torch.optim.Adam(model.parameters(), lr=config.lr)
+                 if fluid_mode else None)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"=== Training {args.mode.upper()} model ===")
@@ -220,8 +275,15 @@ def main():
     start = time.time()
     for epoch in range(config.num_epochs):
         print(f"\nEpoch {epoch+1}/{config.num_epochs}")
-        train_energy, train_ppl, global_step = train_epoch(
-            model, train_loader, config, global_step, device)
+        if fluid_mode:
+            train_energy, train_ppl, global_step = train_epoch_fluid(
+                model, train_loader, config, global_step, device,
+                optimizer, max_steps=args.max_steps)
+            if args.max_steps is not None and global_step >= args.max_steps:
+                break
+        else:
+            train_energy, train_ppl, global_step = train_epoch(
+                model, train_loader, config, global_step, device)
 
         model.eval()
         with torch.no_grad():
