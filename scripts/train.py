@@ -131,7 +131,10 @@ def train_epoch_fluid(model, dataloader, config, global_step, device,
         react_total = 0.0
         anchor_total = 0.0
         for blk in model.blocks:
-            fe = getattr(blk.fluid_pc, "last_free_energy", {})
+            fluid_pc = getattr(blk, "fluid_pc", None)
+            if fluid_pc is None:
+                continue
+            fe = getattr(fluid_pc, "last_free_energy", {})
             if fe:
                 react_total = react_total + fe["reaction"]
                 anchor_total = anchor_total + fe["v_anchor"]
@@ -249,6 +252,9 @@ def main():
     parser.add_argument("--attn-mode", choices=["attn", "fluid"],
                         default="attn",
                         help="'fluid' replaces attention with FluidPCBlock (IFN §10.6)")
+    parser.add_argument("--bypass-pc", action="store_true",
+                        help="Use Adam+backprop instead of vendor PCLayer Hebbian "
+                             "(only valid with --mode wavelet --attn-mode attn)")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Cap total training steps (smoke test)")
     parser.add_argument("--fluid-outer-iters", type=int, default=2)
@@ -264,14 +270,16 @@ def main():
         config.td_alpha = args.td_alpha
         config.beta = args.beta
         config.attn_mode = args.attn_mode
+        config.bypass_pc = args.bypass_pc
         if args.attn_mode == "fluid":
             config.fluid_outer_iters = args.fluid_outer_iters
             config.mpc_horizon = args.mpc_horizon
             config.mpc_inner_steps = args.mpc_inner_steps
     model = build_model(config, args.mode).to(device)
     fluid_mode = (args.mode == "wavelet" and args.attn_mode == "fluid")
+    adam_mode = fluid_mode or (args.mode == "wavelet" and args.bypass_pc)
     optimizer = (torch.optim.Adam(model.parameters(), lr=config.lr)
-                 if fluid_mode else None)
+                 if adam_mode else None)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"=== Training {args.mode.upper()} model ===")
@@ -291,7 +299,7 @@ def main():
     start = time.time()
     for epoch in range(config.num_epochs):
         print(f"\nEpoch {epoch+1}/{config.num_epochs}")
-        if fluid_mode:
+        if adam_mode:
             train_energy, train_ppl, global_step = train_epoch_fluid(
                 model, train_loader, config, global_step, device,
                 optimizer, max_steps=args.max_steps)

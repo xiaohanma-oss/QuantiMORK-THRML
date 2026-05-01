@@ -326,10 +326,49 @@ class WaveletPCTransformer(nn.Module):
 
         return self.output.output(x)
 
+    def forward_attn_adam(self, input_ids):
+        """Standard-autograd forward for `attn_mode='attn'` + bypass_pc.
+
+        Mirrors `forward_fluid` but uses standard scaled-dot-product
+        self-attention over `block.attn.q/k/v/output` linears. Used for
+        the v0+Adam fair-control benchmark (same wavelet+attn architecture
+        as default v0, but trained via Adam+backprop instead of vendor
+        Hebbian PC — isolates the optimizer effect from the architecture
+        effect when comparing to v1 fluid.
+        """
+        import torch.nn.functional as F
+        B, S = input_ids.shape
+        device = input_ids.device
+        vocab_size = self.output.config.vocab_size
+        if input_ids.max() >= vocab_size:
+            input_ids = torch.clamp(input_ids, max=vocab_size - 1)
+        position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+
+        word = self.embedding.word_embeddings(input_ids)
+        pos = self.embedding.position_embeddings(position_ids)
+        x = self.embedding.rms_norm(word + pos)
+
+        for block in self.blocks:
+            attn = block.attn
+            n_heads = attn.num_heads
+            head_dim = attn.head_dim
+            normed = block.ln1(x)
+            q = attn.q(normed).view(B, S, n_heads, head_dim).transpose(1, 2)
+            k = attn.k(normed).view(B, S, n_heads, head_dim).transpose(1, 2)
+            v = attn.v(normed).view(B, S, n_heads, head_dim).transpose(1, 2)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = out.transpose(1, 2).contiguous().view(B, S, -1)
+            x = x + attn.output(out)
+            x = x + block.mlp.wavelet(block.ln2(x))
+
+        return self.output.output(x)
+
     def forward(self, target_ids, input_ids, use_kv_cache=False):
         """Forward pass — identical logic to PCTransformer.forward."""
         if self._attn_mode == "fluid":
             return self.forward_fluid(input_ids)
+        if getattr(self.config, "bypass_pc", False):
+            return self.forward_attn_adam(input_ids)
         for module in self.modules():
             if hasattr(module, "clear_energy"):
                 module.clear_energy()
