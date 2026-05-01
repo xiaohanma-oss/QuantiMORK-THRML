@@ -36,6 +36,7 @@ from thrml.factor import FactorSamplingProgram
 
 from quantimork_thrml.gaussian_ebm import (
     ContinuousNode,
+    CouplingFactor,
     GaussianSampler,
     LinearFactor,
     QuadraticFactor,
@@ -190,10 +191,177 @@ def run_density_update_verification(
     }
 
 
+def host_leray_projection(
+    topology: FluidGraphTopology,
+    u_raw: np.ndarray,
+    lambda_div: float,
+) -> np.ndarray:
+    """Analytic posterior mean of `(I + lambda * B B^T)^{-1} u_raw`.
+
+    As lambda -> infinity this approaches the Leray projection of `u_raw`
+    onto the divergence-free subspace.
+    """
+    n_e = topology.n_edges
+    n_v = topology.n_nodes
+    src = np.asarray(topology.edge_src, dtype=np.int64)
+    dst = np.asarray(topology.edge_dst, dtype=np.int64)
+    B = np.zeros((n_e, n_v), dtype=np.float32)
+    np.add.at(B, (np.arange(n_e), src), 1.0)
+    np.add.at(B, (np.arange(n_e), dst), -1.0)
+    BBt = B @ B.T
+    sys = np.eye(n_e, dtype=np.float32) + lambda_div * BBt
+    return np.linalg.solve(sys, u_raw.astype(np.float32))
+
+
+def build_velocity_solve_graph(
+    topology: FluidGraphTopology,
+    u_raw: np.ndarray,
+    lambda_div: float = 10.0,
+    precision: float = 1.0,
+    max_nodes: int = MAX_NODES,
+) -> dict:
+    """Build a Gaussian factor graph for the Leray velocity-solve step.
+
+    Energy:  E(u) = 0.5 * prec * ||u - u_raw||^2
+                  + 0.5 * lambda * ||B^T u||^2
+                  = 0.5 * u^T (prec * I + lambda * B B^T) u - prec * u^T u_raw
+
+    Encoded on a single `u_block` of size `max_nodes`:
+      * `QuadraticFactor` diagonal precision  prec + lambda * 2
+        (each edge contributes |+1|^2 + |-1|^2 = 2 to (BB^T)_ee).
+      * `LinearFactor` bias  -prec * u_raw  (so posterior mean shifts to u_raw).
+      * `CouplingFactor` per off-diagonal (e1, e2) of BB^T (edges sharing a
+        node), weight  +/- lambda  depending on whether the shared endpoint
+        carries the same incidence sign on both edges.
+
+    Posterior mean = (prec*I + lambda*B B^T)^{-1} * (prec * u_raw).
+    """
+    src_full = np.asarray(topology.edge_src, dtype=np.int64)
+    dst_full = np.asarray(topology.edge_dst, dtype=np.int64)
+    n_free = min(max_nodes, topology.n_edges)
+    src = src_full[:n_free]
+    dst = dst_full[:n_free]
+    u_raw_clip = u_raw[:n_free].astype(np.float32)
+
+    pair_a = []
+    pair_b = []
+    pair_w = []
+    for e1 in range(n_free):
+        for e2 in range(e1 + 1, n_free):
+            shared = 0.0
+            if src[e1] == src[e2]:
+                shared += 1.0
+            if dst[e1] == dst[e2]:
+                shared += 1.0
+            if src[e1] == dst[e2]:
+                shared -= 1.0
+            if dst[e1] == src[e2]:
+                shared -= 1.0
+            if shared != 0.0:
+                pair_a.append(e1)
+                pair_b.append(e2)
+                pair_w.append(float(lambda_div) * shared)
+
+    diag_prec = float(precision) + 2.0 * float(lambda_div)
+    prec_diag = jnp.full((n_free,), diag_prec, dtype=jnp.float32)
+    bias = -float(precision) * jnp.asarray(u_raw_clip, dtype=jnp.float32)
+
+    u_nodes = [ContinuousNode() for _ in range(n_free)]
+    u_block = Block(u_nodes)
+    quad_fac = QuadraticFactor(1.0 / prec_diag, u_block)
+    lin_fac = LinearFactor(bias, u_block)
+    factors = [quad_fac, lin_fac]
+    if pair_a:
+        view_a = Block([u_nodes[i] for i in pair_a])
+        view_b = Block([u_nodes[i] for i in pair_b])
+        coup = CouplingFactor(
+            jnp.asarray(pair_w, dtype=jnp.float32),
+            (view_a, view_b),
+        )
+        factors.append(coup)
+
+    sampler = GaussianSampler()
+    spec = BlockGibbsSpec(
+        [u_block], [],
+        {ContinuousNode: jax.ShapeDtypeStruct((), jnp.float32)},
+    )
+    program = FactorSamplingProgram(
+        gibbs_spec=spec,
+        samplers=[sampler],
+        factors=factors,
+        other_interaction_groups=[],
+    )
+
+    sub_topo = FluidGraphTopology(
+        S=topology.S, D=topology.D, n_levels=topology.n_levels,
+        band_sizes=topology.band_sizes, band_offsets=topology.band_offsets,
+        n_nodes=topology.n_nodes,
+        edge_src=tuple(int(s) for s in src),
+        edge_dst=tuple(int(d) for d in dst),
+        n_lateral=min(topology.n_lateral, n_free),
+        n_cross=max(0, n_free - topology.n_lateral),
+    )
+    target = host_leray_projection(sub_topo, u_raw_clip,
+                                   lambda_div=lambda_div)
+    return {
+        "program": program,
+        "spec": spec,
+        "u_block": u_block,
+        "n_nodes": n_free,
+        "target": np.asarray(target, dtype=np.float32),
+        "lambda": lambda_div,
+        "precision": precision,
+    }
+
+
+def run_velocity_solve_verification(
+    graph: dict,
+    seed: int = 0,
+    n_batches: int = DEFAULT_N_BATCHES,
+    schedule: SamplingSchedule = DEFAULT_SCHEDULE,
+) -> dict:
+    """Sample the velocity-solve graph and report MSE versus the analytic
+    posterior mean.
+    """
+    spec = graph["spec"]
+    prog = graph["program"]
+    target = graph["target"]
+    n_free = graph["n_nodes"]
+
+    key = jax.random.key(seed)
+    init_state = []
+    for block in spec.free_blocks:
+        key, sk = jax.random.split(key)
+        init_state.append(
+            0.1 * jax.random.normal(sk, (n_batches, len(block.nodes))))
+    keys = jax.random.split(key, n_batches)
+    observe_blocks = list(spec.free_blocks)
+
+    samples = jax.jit(jax.vmap(
+        lambda s, c, k_: sample_states(k_, prog, schedule, s, c, observe_blocks)
+    ))(init_state, [], keys)
+
+    sampled = []
+    for i in range(n_free):
+        sampled.append(float(jnp.mean(samples[0][:, :, i])))
+    sampled = jnp.asarray(sampled, dtype=jnp.float32)
+    target_jax = jnp.asarray(target, dtype=jnp.float32)
+    mse = float(jnp.mean((sampled - target_jax) ** 2))
+    return {
+        "sampled_values": [float(v) for v in sampled],
+        "target_values": [float(v) for v in target],
+        "mse": mse,
+        "n_nodes": n_free,
+    }
+
+
 __all__ = [
     "build_density_update_graph",
+    "build_velocity_solve_graph",
     "run_density_update_verification",
+    "run_velocity_solve_verification",
     "host_density_update",
+    "host_leray_projection",
     "DEFAULT_PRECISION",
     "DEFAULT_SCHEDULE",
     "DEFAULT_N_BATCHES",
