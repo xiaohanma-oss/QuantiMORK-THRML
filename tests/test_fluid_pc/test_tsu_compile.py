@@ -57,6 +57,38 @@ def test_velocity_solve_posterior_matches_analytic_leray_softpenalty():
 
 
 @pytest.mark.slow
+def test_reaction_step_posterior_matches_torch_predictor():
+    import torch
+    from quantimork_thrml.fluid_pc.cross_scale_predictor import CrossScalePredictor
+    from quantimork_thrml.fluid_pc.graph import WaveletGraph
+    from quantimork_thrml.fluid_pc.tsu_compile import (
+        build_reaction_step_graph, run_reaction_verification,
+    )
+    np.random.seed(13)
+    topo = build_topology(S=4, D=8, n_levels=2)
+    g = WaveletGraph(S=4, D=8, n_levels=2)
+    pred = CrossScalePredictor(g)
+    rho_np = np.abs(np.random.randn(topo.n_nodes).astype(np.float32))
+    rho_np /= rho_np.sum()
+    eta = 0.1
+    with torch.no_grad():
+        a_hat = pred(torch.from_numpy(rho_np)[None])
+        torch_target = (torch.from_numpy(rho_np)[None]
+                        - eta * (torch.from_numpy(rho_np)[None] - a_hat))
+    graph = build_reaction_step_graph(
+        topo, rho_np,
+        theta_lat=float(pred.theta_lat),
+        theta_up=float(pred.theta_up),
+        theta_down=float(pred.theta_down),
+        bias=float(pred.bias),
+        eta=eta, precision=2.0, max_nodes=8)
+    r = run_reaction_verification(graph, seed=13, n_batches=200)
+    assert r["mse"] < 0.01
+    np.testing.assert_allclose(
+        graph["target"], torch_target[0, :8].numpy(), atol=1e-5)
+
+
+@pytest.mark.slow
 def test_compile_fluid_pc_iteration_runs_end_to_end():
     np.random.seed(3)
     topo = build_topology(S=4, D=8, n_levels=2)

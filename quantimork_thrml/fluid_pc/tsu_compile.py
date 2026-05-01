@@ -51,6 +51,86 @@ DEFAULT_N_BATCHES = 200
 MAX_NODES = 16
 
 
+def host_cross_scale_predict(
+    topology: FluidGraphTopology,
+    rho: np.ndarray,
+    theta_lat: float,
+    theta_up: float,
+    theta_down: float,
+    bias: float,
+) -> np.ndarray:
+    """Numpy mirror of CrossScalePredictor.forward, used for the TSU bias.
+
+    â_i = Θ_lat * Σ_{j ∈ lat-nbr(i)} a_j
+        + Θ_up  * Σ_{p ∈ parents(i)} a_p
+        + Θ_down * Σ_{c ∈ children(i)} a_c
+        + b
+    """
+    src = np.asarray(topology.edge_src, dtype=np.int64)
+    dst = np.asarray(topology.edge_dst, dtype=np.int64)
+    n_lat = topology.n_lateral
+    out = np.zeros_like(rho)
+    if n_lat > 0:
+        np.add.at(out, dst[:n_lat], theta_lat * rho[src[:n_lat]])
+        np.add.at(out, src[:n_lat], theta_lat * rho[dst[:n_lat]])
+    if len(src) > n_lat:
+        np.add.at(out, dst[n_lat:], theta_down * rho[src[n_lat:]])
+        np.add.at(out, src[n_lat:], theta_up   * rho[dst[n_lat:]])
+    return out + float(bias)
+
+
+def build_reaction_step_graph(
+    topology: FluidGraphTopology,
+    rho_init: np.ndarray,
+    theta_lat: float, theta_up: float, theta_down: float, bias: float,
+    eta: float = 0.1,
+    precision: float = DEFAULT_PRECISION,
+    max_nodes: int = MAX_NODES,
+) -> dict:
+    """TSU factor graph for one cross-scale PC reaction step (IFN §10.4).
+
+    a_new = a - eta * (a - â(a)) = (1-eta)*a + eta * (M*a + b)
+    Linear in a → encode as Gaussian with posterior mean = a_new.
+    """
+    a_hat = host_cross_scale_predict(
+        topology, rho_init, theta_lat, theta_up, theta_down, bias)
+    target_full = rho_init - eta * (rho_init - a_hat)
+    n_free = min(max_nodes, topology.n_nodes)
+    target = target_full[:n_free].astype(np.float32)
+
+    prec_diag = jnp.full((n_free,), float(precision), dtype=jnp.float32)
+    bias_jax = -float(precision) * jnp.asarray(target, dtype=jnp.float32)
+    nodes = [ContinuousNode() for _ in range(n_free)]
+    out_block = Block(nodes)
+    spec = BlockGibbsSpec(
+        [out_block], [],
+        {ContinuousNode: jax.ShapeDtypeStruct((), jnp.float32)},
+    )
+    program = FactorSamplingProgram(
+        gibbs_spec=spec,
+        samplers=[GaussianSampler()],
+        factors=[QuadraticFactor(1.0 / prec_diag, out_block),
+                 LinearFactor(bias_jax, out_block)],
+        other_interaction_groups=[],
+    )
+    return {
+        "program": program, "spec": spec,
+        "out_block": out_block, "n_nodes": n_free,
+        "target": target, "precision": precision,
+    }
+
+
+def run_reaction_verification(
+    graph: dict, seed: int = 0,
+    n_batches: int = DEFAULT_N_BATCHES,
+    schedule: SamplingSchedule = DEFAULT_SCHEDULE,
+) -> dict:
+    """Sample reaction-step graph; report MSE vs analytic post-reaction density."""
+    return run_density_update_verification(graph, seed=seed,
+                                           n_batches=n_batches,
+                                           schedule=schedule)
+
+
 def host_density_update(
     topology: FluidGraphTopology,
     rho_init: np.ndarray,
@@ -406,10 +486,13 @@ def compile_fluid_pc_iteration(
 
 __all__ = [
     "build_density_update_graph",
+    "build_reaction_step_graph",
     "build_velocity_solve_graph",
     "compile_fluid_pc_iteration",
     "run_density_update_verification",
+    "run_reaction_verification",
     "run_velocity_solve_verification",
+    "host_cross_scale_predict",
     "host_density_update",
     "host_leray_projection",
     "DEFAULT_PRECISION",
