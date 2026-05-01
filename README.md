@@ -399,6 +399,45 @@ connections at level 1), exceeding TSU's ~12-neighbor hardware limit.
 See [Connectivity & Sparsity](#connectivity--sparsity) for analysis and
 candidate sparsification directions.
 
+## FluidPCBlock — IFN §10.6 Option A
+
+`quantimork_thrml/fluid_pc/` implements the Wavelet-Fluid PC block from
+[Incompressible Fluid Networks](docs/references/incompressible-fluid-networks/full-text.md)
+§10.6 as a drop-in attention replacement. Tensor signature `(B, S, D) → (B, S, D)`.
+
+Per-iteration pipeline (k = 1..K):
+
+1. **Reaction** — predict density via a small `WaveletLinear` and descend
+   on local prediction error.
+2. **MPC drift** — receding-horizon optimization over per-edge velocity
+   `u ∈ ℝ^|E|` with control + terminal cost (target: initial density).
+3. **Leray projection** — Jacobi-CG on the graph Laplacian to enforce
+   `∇·u = 0` (with implicit-IFT backward).
+4. **CFL rescale** — `dt = min(target_cfl / max|u|, dt_max)`.
+5. **Conservative advection** — upwind flux + κ-Laplacian diffusion;
+   mass-conserving by construction.
+
+Activated by `config.attn_mode = 'fluid'`. Default `'attn'` keeps
+existing behavior bit-for-bit. The fluid mode uses standard autograd
+(the "PC" semantics live inside the block, in the K iterations of energy
+descent on density), bypassing the vendor PCLayer iterative scheme.
+
+TSU verification path: `quantimork_thrml.fluid_pc.tsu_compile.build_density_update_graph`
+mirrors `pmode_verify.py` for the linear-in-ρ density-update step. Phase-1
+verifies one operator-splitting step (advection + diffusion); the bilinear
+velocity solve and full K-iteration alternation are deferred to Phase 2.
+
+```python
+from quantimork_thrml.model import WaveletPCTransformer
+
+config.attn_mode = 'fluid'
+config.fluid_outer_iters = 3   # K
+config.mpc_horizon = 4         # H
+config.mpc_inner_steps = 5
+model = WaveletPCTransformer(config)
+logits = model(target_ids, input_ids)   # routes to forward_fluid()
+```
+
 ## Connectivity & Sparsity
 
 The wavelet decomposition creates a tree topology where each coefficient
@@ -451,7 +490,17 @@ quantimork_thrml/
 ├── model.py              # WaveletPCTransformer (replaces MLP in PC-Transformers)
 ├── thrml_verify.py       # Factor graph verification (categorical + pmode dispatch)
 ├── gaussian_ebm.py       # ContinuousNode, QuadraticFactor, CouplingFactor, GaussianSampler
-└── pmode_verify.py       # P-mode (continuous Gaussian) factor graph verification
+├── pmode_verify.py       # P-mode (continuous Gaussian) factor graph verification
+└── fluid_pc/             # FluidPCBlock — IFN §10.6 drop-in attention replacement
+    ├── topology.py       # FluidGraphTopology — node/edge layout (shared torch + thrml)
+    ├── graph.py          # WaveletGraph: incidence, divergence, gradient, Laplacian
+    ├── leray.py          # Graph-Poisson Leray projection (CG with implicit-IFT backward)
+    ├── advection.py      # Conservative upwind advection + Laplacian diffusion
+    ├── reaction.py       # PC reaction step on density (uses WaveletLinear predictor)
+    ├── drift_mpc.py      # Receding-horizon MPC over per-edge velocity
+    ├── readout.py        # ρ → (B,S,D) per-band readout
+    ├── fluid_pc_block.py # FluidPCBlock(B,S,D)→(B,S,D)
+    └── tsu_compile.py    # Density-update factor graph (verified vs ConservativeAdvection)
 scripts/
 ├── prepare_data.py       # Download + tokenize Tiny Shakespeare
 ├── train.py              # Train wavelet or baseline model
@@ -463,7 +512,8 @@ tests/
 ├── test_wavelet_linear.py # Shape, params, gradients
 ├── test_model.py         # Forward pass smoke test
 ├── test_thrml_verify.py  # TSU factor graph energy equivalence
-└── test_baseline_compare.py # Wavelet vs dense regression comparison
+├── test_baseline_compare.py # Wavelet vs dense regression comparison
+└── test_fluid_pc/        # FluidPCBlock unit + TSU verification tests
 vendor/
 └── PC-Transformers/      # iCog-Labs baseline (git submodule)
 ```

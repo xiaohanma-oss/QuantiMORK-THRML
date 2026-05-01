@@ -31,6 +31,7 @@ from utils.device_utils import (
 
 from quantimork_thrml.wavelet_linear import WaveletLinear
 from quantimork_thrml.haar import haar_dwt_1d
+from quantimork_thrml.fluid_pc import FluidPCBlock
 
 
 class WaveletMLP(nn.Module):
@@ -227,12 +228,35 @@ class WaveletTransformerBlock(nn.Module):
         self.mlp = WaveletMLP(config)
 
 
+class FluidWaveletTransformerBlock(nn.Module):
+    """Transformer block with FluidPCBlock replacing attention (IFN §10.6).
+
+    Used when `config.attn_mode == 'fluid'`. The fluid block bypasses the
+    vendor PCLayer machinery entirely — it runs its own internal energy
+    descent (wavelet-fluid PC) and trains via standard autograd. The
+    `WaveletMLP` slot still uses Hebbian PC updates as in `WaveletTransformerBlock`,
+    but is exercised through a separate `forward_fluid` path on the parent.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln1 = nn.RMSNorm(config.n_embed)
+        self.fluid_pc = FluidPCBlock(config)
+        self.ln2 = nn.RMSNorm(config.n_embed)
+        self.mlp = WaveletMLP(config)
+
+
 class WaveletPCTransformer(nn.Module):
     """PCTransformer with wavelet-sparse MLP blocks.
 
     Architecture identical to PC-Transformers except:
     - MLP blocks use WaveletLinear instead of dense fc1+fc2
     - Everything else (Embedding, Attention, PCLayer, Output) is unchanged
+
+    When `config.attn_mode == 'fluid'`, the per-block attention is replaced
+    by a `FluidPCBlock` (IFN §10.6) and `forward_fluid` is used in place of
+    the iterative PC `forward`. Default `attn_mode='attn'` preserves
+    bit-for-bit existing behavior.
     """
 
     def __init__(self, config):
@@ -240,18 +264,28 @@ class WaveletPCTransformer(nn.Module):
         self.config = config
         self._td_alpha = getattr(config, "td_alpha", 0.5)
         self._beta = getattr(config, "beta", 0.0)
+        self._attn_mode = getattr(config, "attn_mode", "attn")
         self.embedding = Embedding_Layer(config)
+        if self._attn_mode == "fluid":
+            BlockCls = FluidWaveletTransformerBlock
+        else:
+            BlockCls = WaveletTransformerBlock
         self.blocks = nn.ModuleList(
-            [WaveletTransformerBlock(config) for _ in range(config.n_blocks)])
+            [BlockCls(config) for _ in range(config.n_blocks)])
         self.output = OutputLayer(config)
 
     def register_all_lateral_weights(self):
-        """Register lateral weights for all PC layers."""
+        """Register lateral weights for all PC layers (attn-mode only).
+
+        Fluid blocks bypass the vendor PCLayer plumbing, so we skip the
+        per-block attn-side registration when running in `attn_mode='fluid'`.
+        """
         for block in self.blocks:
-            block.attn.pc_qkv.register_lateral(
-                "attn", block.attn.q.in_features)
-            block.attn.pc_output.register_lateral(
-                "linear", block.attn.output.in_features)
+            if self._attn_mode != "fluid":
+                block.attn.pc_qkv.register_lateral(
+                    "attn", block.attn.q.in_features)
+                block.attn.pc_output.register_lateral(
+                    "linear", block.attn.output.in_features)
             block.mlp.pc_layer1.register_lateral(
                 "fc1", block.mlp.wavelet.in_features)
             block.mlp.pc_layer2.register_lateral(
@@ -266,8 +300,36 @@ class WaveletPCTransformer(nn.Module):
                         module.W_latents[key] = module.W_latents[key].to(
                             next(self.parameters()).device)
 
+    def forward_fluid(self, input_ids):
+        """Standard-autograd forward for `attn_mode='fluid'`.
+
+        The fluid block runs internal energy descent (wavelet-fluid PC), so
+        the outer training loop uses standard backprop rather than the
+        vendor PCLayer iterative scheme. The MLP's `WaveletLinear` is
+        invoked as a plain layer here too — its Hebbian path is reserved
+        for `attn_mode='attn'`.
+        """
+        B, S = input_ids.shape
+        device = input_ids.device
+        vocab_size = self.output.config.vocab_size
+        if input_ids.max() >= vocab_size:
+            input_ids = torch.clamp(input_ids, max=vocab_size - 1)
+        position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+
+        word = self.embedding.word_embeddings(input_ids)
+        pos = self.embedding.position_embeddings(position_ids)
+        x = self.embedding.rms_norm(word + pos)
+
+        for block in self.blocks:
+            x = x + block.fluid_pc(block.ln1(x))
+            x = x + block.mlp.wavelet(block.ln2(x))
+
+        return self.output.output(x)
+
     def forward(self, target_ids, input_ids, use_kv_cache=False):
         """Forward pass — identical logic to PCTransformer.forward."""
+        if self._attn_mode == "fluid":
+            return self.forward_fluid(input_ids)
         for module in self.modules():
             if hasattr(module, "clear_energy"):
                 module.clear_energy()
