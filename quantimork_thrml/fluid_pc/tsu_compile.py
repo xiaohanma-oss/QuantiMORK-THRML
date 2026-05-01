@@ -355,9 +355,59 @@ def run_velocity_solve_verification(
     }
 
 
+def compile_fluid_pc_iteration(
+    topology: FluidGraphTopology,
+    rho: np.ndarray,
+    u_raw: np.ndarray,
+    dt: float,
+    kappa: float,
+    lambda_div: float = 100.0,
+    precision: float = 1.0,
+    max_nodes: int = MAX_NODES,
+    n_batches: int = DEFAULT_N_BATCHES,
+    seed: int = 0,
+    schedule: SamplingSchedule = DEFAULT_SCHEDULE,
+) -> dict:
+    """One full FluidPC inner iteration end-to-end on TSU:
+        Step 1: Leray velocity-solve  -> u (divergence-free)
+        Step 2: density update        -> rho_new
+
+    Returns the rho_new posterior mean (truncated to `max_nodes`) plus per
+    -stage MSE diagnostics. The returned `rho_new` can be fed into the next
+    call to chain K iterations.
+    """
+    v_graph = build_velocity_solve_graph(
+        topology, u_raw, lambda_div=lambda_div,
+        precision=precision, max_nodes=max_nodes)
+    v_res = run_velocity_solve_verification(
+        v_graph, seed=seed, n_batches=n_batches, schedule=schedule)
+    u_proj = np.asarray(v_res["sampled_values"], dtype=np.float32)
+
+    n_e = len(topology.edge_src)
+    if u_proj.shape[0] < n_e:
+        u_full = np.zeros(n_e, dtype=np.float32)
+        u_full[: u_proj.shape[0]] = u_proj
+    else:
+        u_full = u_proj[:n_e]
+
+    d_graph = build_density_update_graph(
+        topology, rho, u_full, dt=dt, kappa=kappa,
+        precision=precision, max_nodes=max_nodes)
+    d_res = run_density_update_verification(
+        d_graph, seed=seed + 1, n_batches=n_batches, schedule=schedule)
+
+    return {
+        "u_proj": u_proj,
+        "rho_new": np.asarray(d_res["sampled_values"], dtype=np.float32),
+        "velocity_mse": v_res["mse"],
+        "density_mse": d_res["mse"],
+    }
+
+
 __all__ = [
     "build_density_update_graph",
     "build_velocity_solve_graph",
+    "compile_fluid_pc_iteration",
     "run_density_update_verification",
     "run_velocity_solve_verification",
     "host_density_update",
