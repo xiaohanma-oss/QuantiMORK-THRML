@@ -426,6 +426,37 @@ existing behavior bit-for-bit. The fluid mode uses standard autograd
 (the "PC" semantics live inside the block, in the K iterations of energy
 descent on density), bypassing the vendor PCLayer iterative scheme.
 
+### Tiny Shakespeare benchmark (n_embed=128, n_blocks=4, batch=8)
+
+Multi-epoch comparison with optimizer matched (Adam+backprop via
+`--bypass-pc` for the attn baseline, eliminating the Hebbian-vs-Adam
+confound):
+
+| Model | params | best val PPL | overfit? |
+|---|---|---|---|
+| PC-Transformer baseline (vendor, Hebbian) | 1.06M | 985.7 @ ep1 | barely trains in 1 ep |
+| v0 wavelet+attn (Hebbian) | 0.56M | 993.5 @ ep1 | barely trains in 1 ep |
+| **v0 wavelet+attn + Adam** | **0.56M** | **165.7 @ ep4** | severe (ep10 → 305) |
+| **v1 wavelet+fluid (Adam)** | **0.30M** | **158.3 @ ep5** | none (still descending) |
+
+Two findings worth calling out:
+
+1. **Most of the apparent fluid PPL win is the optimizer**. With Hebbian
+   PC, both vendor and v0 stay flat near PPL ~990 in 1 epoch. Adam +
+   backprop drops both attn and fluid to the 160s.
+2. **The remaining architectural delta favors fluid**: at matched Adam,
+   fluid gets a slightly better best-PPL with **half the parameters**
+   AND keeps descending while attn overfits. This is the conservative-
+   transport + cycle-space-basis inductive bias acting as implicit
+   regularization, exactly the role IFN §10.6 ascribes to FluidPC.
+
+To reproduce:
+```bash
+python scripts/train.py --mode wavelet --attn-mode attn --bypass-pc --epochs 10
+python scripts/train.py --mode wavelet --attn-mode fluid --epochs 5 \
+  --fluid-outer-iters 2 --mpc-horizon 2 --mpc-inner-steps 3
+```
+
 TSU verification path: `quantimork_thrml.fluid_pc.tsu_compile.build_density_update_graph`
 mirrors `pmode_verify.py` for the linear-in-ρ density-update step. Phase-1
 verifies one operator-splitting step (advection + diffusion); the bilinear
